@@ -3,13 +3,14 @@ import type { RoomActions, RoomActivity } from "./adapters/bancho.js";
 import { OsuApiRequestError, type OsuApi } from "./adapters/osu.js";
 import { DEFAULT_CONFIG, gameModeLabel, type GameMode, type LobbyConfig, type MapInfo, type Participant } from "./types.js";
 import { checkMap } from "./services/regulations.js";
-import { fractionalElo, winRate } from "./services/elo.js";
+import { evaluateRoundScores, persistMatchPoints, type RawPlayerScore } from "./services/party-scoring.js";
 import { balancedTeams } from "./services/teams.js";
 import { VoteBook } from "./services/votes.js";
 
 const admins = new Set((process.env.ADMIN_OSU_IDS ?? "").split(",").filter(Boolean).map(Number));
 const fmt = (s: number) => `${Math.floor(s / 60)}m ${s % 60}s`;
 const fmtSession = (s: number) => `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m ${s % 60}s`;
+const winRate = (s: { wins: number; matches: number }) => (s.matches > 0 ? Math.round((s.wins / s.matches) * 100) : 0);
 export type LobbyActivity = RoomActivity;
 type RandomEvent = { teamMode: 0 | 2; scoreMode: 0 | 1 | 2; label: string };
 const RANDOM_EVENTS: RandomEvent[] = [
@@ -21,18 +22,61 @@ const RANDOM_EVENTS: RandomEvent[] = [
 ];
 
 export class LobbyController {
-  private config: LobbyConfig; private queue: number[] = []; private autoSkip = new Set<number>(); private votes = new VoteBook();
-  private timer?: NodeJS.Timeout; private startedAt?: Date; private matchId?: number; private activeBeatmapId?: number; private matchGameMode?: GameMode; private selectedGameMode?: GameMode; private matchParticipants: Participant[] = []; private teamEvent = false; private eventActive = false; private lastValidMapId?: number; private lastAnnouncedMapId?: number; private passwordSetUntil = 0;
-  private turnTimer?: NodeJS.Timeout; private turnWarnings: NodeJS.Timeout[] = []; private turnHostId?: number; private turnMapId?: number; private turnStage?: "select" | "start"; private intendedHostId?: number;
+  private config: LobbyConfig;
+  private queue: number[] = [];
+  private autoSkip = new Set<number>();
+  private votes = new VoteBook();
+  private timer?: NodeJS.Timeout;
+  private startedAt?: Date;
+  private matchId?: number;
+  private activeBeatmapId?: number;
+  private matchGameMode?: GameMode;
+  private selectedGameMode?: GameMode;
+  private matchParticipants: Participant[] = [];
+  private teamEvent = false;
+  private eventActive = false;
+  private lastValidMapId?: number;
+  private lastAnnouncedMapId?: number;
+  private passwordSetUntil = 0;
+  private turnTimer?: NodeJS.Timeout;
+  private turnWarnings: NodeJS.Timeout[] = [];
+  private turnHostId?: number;
+  private turnMapId?: number;
+  private turnStage?: "select" | "start";
+  private intendedHostId?: number;
   private readonly activityLog: LobbyActivity[] = [];
-  private readonly closeListeners = new Set<() => void>(); private closeRequested = false;
-  constructor(private db: PrismaClient, private lobbyId: number, private room: RoomActions, private osu: OsuApi, config: LobbyConfig = DEFAULT_CONFIG) { this.config = { ...DEFAULT_CONFIG, ...config, ranked: config.ranked !== false, regulations: { ...DEFAULT_CONFIG.regulations, ...config.regulations }, locks: { ...DEFAULT_CONFIG.locks, ...config.locks } }; }
+  private readonly closeListeners = new Set<() => void>();
+  private closeRequested = false;
+
+  constructor(
+    private db: PrismaClient,
+    private lobbyId: number,
+    private room: RoomActions,
+    private osu: OsuApi,
+    config: LobbyConfig = DEFAULT_CONFIG
+  ) {
+    this.config = {
+      ...DEFAULT_CONFIG,
+      ...config,
+      ranked: config.ranked !== false,
+      regulations: { ...DEFAULT_CONFIG.regulations, ...config.regulations },
+      locks: { ...DEFAULT_CONFIG.locks, ...config.locks }
+    };
+  }
+
   activity() { return this.activityLog.slice(-200); }
   onClosed(listener: () => void) { this.closeListeners.add(listener); }
   shouldAutoRecreate() { return this.config.autoRecreateOnInactivity && !this.closeRequested; }
   recreationInput() { return { title: this.config.title, password: this.config.password, config: this.config }; }
-  private logActivity(level: LobbyActivity["level"], message: string) { this.activityLog.push({ at: new Date().toISOString(), level, message }); if (this.activityLog.length > 200) this.activityLog.shift(); }
-  private runActivity(label: string, task: () => Promise<unknown>) { this.logActivity("info", label); void task().catch(error => this.logActivity("error", `${label} failed: ${error instanceof Error ? error.message : String(error)}`)); }
+  private logActivity(level: LobbyActivity["level"], message: string) {
+    this.activityLog.push({ at: new Date().toISOString(), level, message });
+    if (this.activityLog.length > 200) this.activityLog.shift();
+  }
+  private runActivity(label: string, task: () => Promise<unknown>) {
+    this.logActivity("info", label);
+    void task().catch(error => this.logActivity("error", `${label} failed: ${error instanceof Error ? error.message : String(error)}`));
+  }
+
   async start() {
     this.room.onActivity(activity => this.logActivity(activity.level, activity.message));
     this.room.onMessage((p, t) => this.runActivity(`Chat from ${p.username}`, () => this.handle(p, t)));
@@ -45,12 +89,18 @@ export class LobbyController {
     this.room.onAllPlayersReady(() => this.runActivity("All players ready", () => this.allPlayersReady()));
     this.room.onMatchStarted(() => this.runActivity("Match started", () => this.beginMatch()));
     this.room.onMatchFinished(s => this.runActivity(`Match finished: ${s.length} result(s)`, () => this.finish(s)));
-    this.room.onClosed(() => { this.logActivity("info", "Bancho closed this lobby channel."); void this.removeEmptyHistory(); for (const listener of this.closeListeners) listener(); });
+    this.room.onClosed(() => {
+      this.logActivity("info", "Bancho closed this lobby channel.");
+      void this.removeEmptyHistory();
+      for (const listener of this.closeListeners) listener();
+    });
     await this.joined();
     this.runActivity("Initial host check", () => this.hostChanged(this.room.host()));
     if (this.room.beatmapId()) await this.validateSelection(this.room.beatmapId()!);
   }
+
   private async joined() { await this.syncPlayers(); await this.electHost(); }
+
   private async departed(player: Participant) {
     const wasQueued = this.queue.includes(player.id);
     this.queue = this.queue.filter(id => id !== player.id);
@@ -64,33 +114,38 @@ export class LobbyController {
       ]);
     }
     if (wasQueued) await this.room.say(`${player.username} left and was removed from the queue.`);
-    // Bancho clears host state asynchronously after a host leaves.
     setTimeout(() => this.runActivity("Post-leave host reconciliation", async () => { await this.disableSoloAutoSkip(); await this.electHost(); }), 250);
   }
+
   private async syncPlayers() {
     const players = this.room.players();
     for (const p of players) {
       const existing = await this.db.player.findUnique({ where: { id: p.id } });
-      // Bancho exposes IRC usernames (spaces become underscores). Resolve the
-      // profile ID once so local records retain the player's actual osu! name.
       let username = existing?.username ?? p.username;
       if (!existing || existing.username === p.username && p.username.includes("_")) {
-        try { const user = await this.osu.userById(p.id); if (typeof user.username === "string" && user.username) username = user.username; } catch { /* Keep the current local name if the profile lookup is temporarily unavailable. */ }
+        try {
+          const user = await this.osu.userById(p.id);
+          if (typeof user.username === "string" && user.username) username = user.username;
+        } catch { /* Retain current name if API is temporarily unavailable */ }
       }
       const saved = await this.db.player.upsert({ where: { id: p.id }, create: { id: p.id, username }, update: username === existing?.username ? {} : { username } });
       if (!saved.denied && !this.queue.includes(p.id)) this.queue.push(p.id);
       await this.db.lobbyPlayer.upsert({ where: { lobbyId_playerId: { lobbyId: this.lobbyId, playerId: p.id } }, create: { lobbyId: this.lobbyId, playerId: p.id }, update: {} });
     }
   }
+
   private isHost(p: Participant) { return this.room.host()?.id === p.id; }
+
   private async electHost(attempt = 0) {
     const activePlayerIds = new Set(this.room.players().map(player => player.id));
     this.queue = this.queue.filter(id => activePlayerIds.has(id));
     if (this.room.host() || !this.queue[0]) return;
-    const next = this.queue[0]; this.intendedHostId = next;
+    const next = this.queue[0];
+    this.intendedHostId = next;
     try {
       await this.room.command(`!mp host #${next}`);
-      this.reapplyTitle(); this.reapplyPassword();
+      this.reapplyTitle();
+      this.reapplyPassword();
       await this.room.say(`Host assigned to the first queued player.`);
     } catch (error) {
       this.intendedHostId = undefined;
@@ -98,20 +153,28 @@ export class LobbyController {
       setTimeout(() => this.runActivity(`Host assignment retry ${attempt + 1}`, () => this.electHost(attempt + 1)), 750 * (attempt + 1));
     }
   }
+
   private async hostChanged(host?: Participant) {
     if (this.matchId) return;
     if (!host) {
-      this.turnHostId = undefined; this.intendedHostId = undefined; this.clearTurnTimer();
+      this.turnHostId = undefined;
+      this.intendedHostId = undefined;
+      this.clearTurnTimer();
       setTimeout(() => this.runActivity("Host-cleared reconciliation", () => this.electHost()), 250);
       return;
     }
     const expectedHostId = this.queue[0];
     if (expectedHostId && host.id !== expectedHostId) {
-      // Ignore Bancho's delayed event for the prior host while our own rotation is pending.
       if (this.intendedHostId === expectedHostId) return;
       const expectedHost = this.room.players().find(player => player.id === expectedHostId);
-      if (!expectedHost) { this.queue = this.queue.filter(id => id !== expectedHostId); this.intendedHostId = undefined; return void this.electHost(); }
-      this.turnHostId = undefined; this.clearTurnTimer(); this.intendedHostId = expectedHostId;
+      if (!expectedHost) {
+        this.queue = this.queue.filter(id => id !== expectedHostId);
+        this.intendedHostId = undefined;
+        return void this.electHost();
+      }
+      this.turnHostId = undefined;
+      this.clearTurnTimer();
+      this.intendedHostId = expectedHostId;
       await this.room.say(`Host rotation is queue-controlled. Passing host to ${expectedHost.username}; use !skip to rotate turns.`);
       await this.room.command(`!mp host #${expectedHostId}`);
       setTimeout(() => this.runActivity("Manual-host correction check", () => this.hostChanged(this.room.host())), 500);
@@ -127,47 +190,76 @@ export class LobbyController {
         this.startTurnTimer("select", host);
         return;
       }
-      this.runActivity("Auto-skip host turn", async () => { await this.room.say(`${host.username}'s host turn was automatically skipped.`); await this.skip(); });
+      this.runActivity("Auto-skip host turn", async () => {
+        await this.room.say(`${host.username}'s host turn was automatically skipped.`);
+        await this.skip();
+      });
       return;
     }
     await this.prepareRoundEvent();
     this.startTurnTimer("select", host);
   }
+
   private clearTurnTimer() {
     if (this.turnTimer) clearTimeout(this.turnTimer);
     for (const warning of this.turnWarnings) clearTimeout(warning);
-    this.turnTimer = undefined; this.turnWarnings = []; this.turnMapId = undefined; this.turnStage = undefined;
+    this.turnTimer = undefined;
+    this.turnWarnings = [];
+    this.turnMapId = undefined;
+    this.turnStage = undefined;
   }
+
   private startTurnTimer(stage: "select" | "start", host: Participant, mapId?: number) {
-    this.clearTurnTimer(); this.turnHostId = host.id; this.turnMapId = mapId; this.turnStage = stage;
+    this.clearTurnTimer();
+    this.turnHostId = host.id;
+    this.turnMapId = mapId;
+    this.turnStage = stage;
     const action = stage === "select" ? "select a map" : "start the match";
-    if (stage === "select") this.runActivity("Select-map timer started", () => this.room.say(`${host.username}, you have 5 minutes to select a map or host will be passed to the next player.`));
+    if (stage === "select") {
+      this.runActivity("Select-map timer started", () =>
+        this.room.say(`${host.username}, you have 5 minutes to select a map or host will be passed to the next player.`)
+      );
+    }
     for (const [delay, remaining] of [[180_000, "2 minutes"], [240_000, "1 minute"], [270_000, "30 seconds"], [290_000, "10 seconds"]] as const) {
-      this.turnWarnings.push(setTimeout(() => this.runActivity(`Turn warning: ${remaining}`, () => this.room.say(`${host.username}: ${remaining} left to ${action}.`)), delay));
+      this.turnWarnings.push(
+        setTimeout(() => this.runActivity(`Turn warning: ${remaining}`, () => this.room.say(`${host.username}: ${remaining} left to ${action}.`)), delay)
+      );
     }
     this.turnTimer = setTimeout(() => this.runActivity("Turn timer expired", () => this.turnExpired(stage, host, mapId)), 300_000);
   }
+
   private async turnExpired(stage: "select" | "start", host: Participant, mapId?: number) {
     if (this.room.host()?.id !== host.id || this.matchId) return;
     this.clearTurnTimer();
-    if (stage === "select") { await this.room.say(`${host.username} ran out of time to select a map. Host passed.`); await this.skip(); }
-    else { await this.room.say(`${host.username} ran out of time to start. Starting automatically.`); await this.startMatch(0); }
+    if (stage === "select") {
+      await this.room.say(`${host.username} ran out of time to select a map. Host passed.`);
+      await this.skip();
+    } else {
+      await this.room.say(`${host.username} ran out of time to start. Starting automatically.`);
+      await this.startMatch(0);
+    }
   }
+
   private async allPlayersReady() {
     if (!this.room.beatmapId() || this.matchId) return;
     this.clearTurnTimer();
     await this.room.say("All players are ready. Starting automatically in 5 seconds.");
     await this.startMatch(5);
   }
+
   private mapSelected(mapId: number) {
     const host = this.room.host();
     if (!host || this.matchId || (this.turnStage === "start" && this.turnHostId === host.id && this.turnMapId === mapId)) return;
     this.startTurnTimer("start", host, mapId);
   }
+
   private async handle(p: Participant, raw: string) {
     if (!raw.startsWith("!") && !raw.startsWith("*")) return;
     this.logActivity("info", `Command from ${p.username}: ${raw}`);
-    await this.syncPlayers(); const [rawCommand, ...args] = raw.trim().split(/\s+/); const cmd = rawCommand.toLowerCase(); const value = args.join(" ");
+    await this.syncPlayers();
+    const [rawCommand, ...args] = raw.trim().split(/\s+/);
+    const cmd = rawCommand.toLowerCase();
+    const value = args.join(" ");
     if (cmd.startsWith("*") && !admins.has(p.id)) return void this.room.say(`${p.username}: administrator permission required.`);
     if (cmd === "!queue") return void this.showQueue();
     if (cmd === "!cmds") return void this.room.say("Command list: https://ronaldonater.com/osu-ahr");
@@ -179,7 +271,7 @@ export class LobbyController {
     if (["!timeleft", "!tl"].includes(cmd)) return void this.timeleft();
     if (["!ostats", "!os"].includes(cmd)) { const { username, mode } = this.usernameAndMode(args); return void this.stats(p, username, mode); }
     if (["!top", "!t"].includes(cmd)) return void this.top(args);
-    if (["!how", "!h"].includes(cmd)) return void this.room.say("Ranked H2H uses fractional ELO: placement earns results, exact ties share rank, and disconnects tie last. K is 40 for 0–10 matches, 24 for 11–100, then 16. Results adjust against the lobby's average ELO. Random events are unranked.");
+    if (["!how", "!h"].includes(cmd)) return void this.room.say("Ranked Party matches award points using the (N - rank) formula. Highest score earns the most points. Random events are unranked.");
     if (cmd === "!rank") { const { username, mode } = this.usernameAndMode(args); return void this.rank(p, username, mode); }
     if (["!lastscore", "!ls"].includes(cmd)) return void this.lastScore();
     if (["!bestscore", "!bs"].includes(cmd)) return void this.bestScore(p, value || undefined);
@@ -194,7 +286,7 @@ export class LobbyController {
     if (cmd === "*skip") return void this.skip();
     if (cmd === "*abort") return void this.abortMatch();
     if (cmd === "*order") return void this.order(value);
-    if (cmd === "*resetelo") return void this.resetElo(args[0]);
+    if (cmd === "*resetelo" || cmd === "*resetpoints") return void this.resetPoints(args[0]);
     if (cmd === "*close") return void this.close();
     if (cmd === "*eventchance") return void this.setEventChance(args[0]);
     if (cmd === "*ranked") return void this.setRanked(args[0]);
@@ -204,7 +296,18 @@ export class LobbyController {
     if (cmd === "*regulation" || cmd === "*no" && args[0] === "regulation") return void this.regulation(cmd === "*no" ? ["disable"] : args);
     if (cmd === "*denylist") return void this.denylist(args);
   }
-  private async vote(kind: string, p: Participant) { const r = this.votes.cast(kind, p.id, this.room.players()); await this.room.say(`${kind}: ${r.count}/${r.required}`); if (r.passed) { this.votes.clear(); if (kind === "skip") await this.skip(); if (kind === "start") await this.startMatch(5); if (kind === "abort") await this.abortMatch(); } }
+
+  private async vote(kind: string, p: Participant) {
+    const r = this.votes.cast(kind, p.id, this.room.players());
+    await this.room.say(`${kind}: ${r.count}/${r.required}`);
+    if (r.passed) {
+      this.votes.clear();
+      if (kind === "skip") await this.skip();
+      if (kind === "start") await this.startMatch(5);
+      if (kind === "abort") await this.abortMatch();
+    }
+  }
+
   private async voteKick(voter: Participant, username: string) {
     if (!username) return void this.room.say("Usage: !votekick [username].");
     const target = this.room.players().find(player => player.username.toLowerCase() === username.toLowerCase());
@@ -218,8 +321,14 @@ export class LobbyController {
     await this.room.command(`!mp kick ${target.username}`);
     await this.room.say(`${target.username} was removed by a player vote.`);
   }
+
   private async abortMatch() { await this.room.command("!mp abort"); await this.room.say("Match aborted."); }
-  private async showQueue() { const rows = await this.db.player.findMany({ where: { id: { in: this.queue } } }); await this.room.say(`Queue: ${this.queue.map((id, i) => `${i + 1}. ${rows.find(x => x.id === id)?.username ?? id}`).join(" | ") || "empty"}`); }
+
+  private async showQueue() {
+    const rows = await this.db.player.findMany({ where: { id: { in: this.queue } } });
+    await this.room.say(`Queue: ${this.queue.map((id, i) => `${i + 1}.${rows.find(x => x.id === id)?.username ?? id}`).join(" | ") || "empty"}`);
+  }
+
   private async setAutoSkip(p: Participant, value?: string) {
     const enabled = value?.toLowerCase();
     if (enabled !== "on" && enabled !== "off") return void this.room.say("Usage: !autoskip [on/off].");
@@ -233,72 +342,109 @@ export class LobbyController {
       await this.room.say(`${p.username}: auto-skip disabled.`);
     }
   }
+
   private async disableSoloAutoSkip() {
     const players = this.room.players();
     if (players.length !== 1) return;
     const player = players[0];
     if (this.autoSkip.delete(player.id)) await this.room.say(`${player.username}: auto-skip disabled because this is now a one-player lobby.`);
   }
-  private async showRegulations() {
-    await this.room.say(this.regulationSummary());
-  }
+
+  private async showRegulations() { await this.room.say(this.regulationSummary()); }
+
   private regulationSummary() {
     const r = this.config.regulations;
     if (!r.enabled) return "Map regulations are currently disabled.";
-    const formatStars = (value?: number) => value === undefined ? "any" : value.toFixed(4).replace(/\.?(0+)$/, "");
+    const formatStars = (value?: number) => (value === undefined ? "any" : value.toFixed(4).replace(/\.?(0+)$/, ""));
     const stars = r.minStar !== undefined || r.maxStar !== undefined ? `${formatStars(r.minStar)}–${formatStars(r.maxStar)}★` : "any star rating";
     const length = r.minLength !== undefined || r.maxLength !== undefined ? `${r.minLength !== undefined ? fmt(r.minLength) : "any"}–${r.maxLength !== undefined ? fmt(r.maxLength) : "any"}` : "any length";
     const mode = r.gameMode ? r.gameMode[0].toUpperCase() + r.gameMode.slice(1) : "any mode";
     const statuses = r.allowedStatuses?.length ? r.allowedStatuses.join(", ") : "all statuses";
-    const range = (min: number | undefined, max: number | undefined, suffix = "") => min !== undefined || max !== undefined ? `${min ?? "any"}–${max ?? "any"}${suffix}` : "any";
+    const range = (min: number | undefined, max: number | undefined, suffix = "") => (min !== undefined || max !== undefined ? `${min ?? "any"}–${max ?? "any"}${suffix}` : "any");
     return `Map regulations — Stars: ${stars} | Length: ${length} | BPM: ${range(r.minBpm, r.maxBpm)} | AR: ${range(r.minAr, r.maxAr)} | HP: ${range(r.minHp, r.maxHp)} | OD: ${range(r.minOd, r.maxOd)} | CS: ${range(r.minCs, r.maxCs)} | Year: ${range(r.minLastUpdatedYear, r.maxLastUpdatedYear)} | Mode: ${mode} | Status: ${statuses} | Converts: ${r.allowConvert ? "allowed" : "not allowed"} | Free mod: ${r.freeMod ? "enabled" : "disabled"}.`;
   }
-  private async skip() { if (this.queue.length) this.queue.push(this.queue.shift()!); const next = this.queue[0]; this.turnHostId = undefined; if (next) { this.intendedHostId = next; await this.room.command(`!mp host #${next}`); } this.reapplyTitle(); this.reapplyPassword(); setTimeout(() => this.runActivity("Host-rotation confirmation", () => this.hostChanged(this.room.host())), 500); await this.showQueue(); }
-  private async startMatch(seconds: number) { if (!Number.isFinite(seconds) || seconds < 0 || seconds > 120) return void this.room.say("Start delay must be between 0 and 120 seconds."); const mapId = this.room.beatmapId(); if (!mapId) return void this.room.say("Select a beatmap first."); const reason = checkMap(await this.osu.beatmap(mapId), this.config.regulations); if (reason) return void this.room.say(`Map rejected: ${reason}.`); this.clearTurnTimer(); this.stopTimer(); this.timer = setTimeout(() => this.runActivity("Match launch", () => this.launch(mapId)), seconds * 1000); await this.room.say(`Match starts in ${seconds}s.`); }
+
+  private async skip() {
+    if (this.queue.length) this.queue.push(this.queue.shift()!);
+    const next = this.queue[0];
+    this.turnHostId = undefined;
+    if (next) {
+      this.intendedHostId = next;
+      await this.room.command(`!mp host #${next}`);
+    }
+    this.reapplyTitle();
+    this.reapplyPassword();
+    setTimeout(() => this.runActivity("Host-rotation confirmation", () => this.hostChanged(this.room.host())), 500);
+    await this.showQueue();
+  }
+
+  private async startMatch(seconds: number) {
+    if (!Number.isFinite(seconds) || seconds < 0 || seconds > 120) return void this.room.say("Start delay must be between 0 and 120 seconds.");
+    const mapId = this.room.beatmapId();
+    if (!mapId) return void this.room.say("Select a beatmap first.");
+    const reason = checkMap(await this.osu.beatmap(mapId), this.config.regulations);
+    if (reason) return void this.room.say(`Map rejected: ${reason}.`);
+    this.clearTurnTimer();
+    this.stopTimer();
+    this.timer = setTimeout(() => this.runActivity("Match launch", () => this.launch(mapId)), seconds * 1000);
+    await this.room.say(`Match starts in ${seconds}s.`);
+  }
+
   private async validateSelection(mapId: number) {
-    // Bancho emits an intermediate empty/invalid map ID while a host changes maps.
-    // Wait for the subsequent real beatmap ID instead of showing an error to chat.
     if (!Number.isInteger(mapId) || mapId <= 0) return;
     try {
       const map = await this.osu.beatmap(mapId);
       const reason = checkMap(map, this.config.regulations);
-      if (!reason) { this.lastValidMapId = mapId; this.selectedGameMode = map.mode; await this.announceSelectedMap(map); this.mapSelected(mapId); return; }
+      if (!reason) {
+        this.lastValidMapId = mapId;
+        this.selectedGameMode = map.mode;
+        await this.announceSelectedMap(map);
+        this.mapSelected(mapId);
+        return;
+      }
       if (this.lastValidMapId) {
         await this.room.command(`!mp map ${this.lastValidMapId}`);
         await this.room.say(`Map rejected: ${reason}. Reverted to the previous valid map.`);
-      } else await this.room.say(`Map rejected: ${reason}. Select a regulation-compliant map.`);
+      } else {
+        await this.room.say(`Map rejected: ${reason}. Select a regulation-compliant map.`);
+      }
     } catch (error) {
       if (error instanceof OsuApiRequestError && error.status === 404 && this.lastValidMapId) {
         await this.room.command(`!mp map ${this.lastValidMapId}`);
         await this.room.say("Map rejected: this map is unsubmitted or deleted. Reverted to the previous valid map.");
       }
-      // API data may be briefly unavailable while Bancho changes the beatmap.
-      // Do not spam the lobby; a later beatmap event will retry validation.
-    } finally { this.reapplyTitle(); this.reapplyPassword(); }
+    } finally {
+      this.reapplyTitle();
+      this.reapplyPassword();
+    }
   }
+
   private reapplyTitle() {
     if (!this.config.locks.title) return;
     void this.room.setTitle(this.config.title).catch(() => undefined);
   }
+
   private reapplyPassword() {
     if (!this.config.locks.password || !this.config.password) return;
     this.passwordSetUntil = Date.now() + 3_000;
     void this.room.command(`!mp password ${this.config.password}`).catch(() => undefined);
   }
+
   private async enforceTitle(title: string) {
     if (!this.config.locks.title || title === this.config.title) return;
     this.reapplyTitle();
     await this.room.say("Lobby title is locked and has been restored.");
   }
+
   private async enforcePassword() {
     if (!this.config.locks.password || !this.config.password || Date.now() < this.passwordSetUntil) return;
     this.reapplyPassword();
     await this.room.say("Lobby password is locked and has been restored.");
   }
+
   private async setLobbyMode(teamMode: number, scoreMode: number) { await this.room.command(`!mp set ${teamMode} ${scoreMode}`); }
+
   private async prepareRoundEvent() {
-    // Decide and configure the next round as soon as host rotates. This gives
-    // Bancho the full map-pick turn to apply the mode/team commands before start.
     this.eventActive = Math.random() < this.config.eventChance;
     this.teamEvent = false;
     if (!this.eventActive) {
@@ -313,39 +459,37 @@ export class LobbyController {
     const players = await this.db.player.findMany({ where: { id: { in: ids } } });
     const mode = this.currentStatsMode();
     const modeStats = await this.db.playerModeStats.findMany({ where: { playerId: { in: ids }, mode } });
-    const eloByPlayer = new Map(modeStats.map(stat => [stat.playerId, stat.elo]));
-    const teams = balancedTeams(players.map(player => ({ ...player, elo: eloByPlayer.get(player.id) ?? 1000 })));
+    const pointsByPlayer = new Map(modeStats.map(stat => [stat.playerId, stat.points]));
+    const teams = balancedTeams(players.map(player => ({ ...player, elo: pointsByPlayer.get(player.id) ?? 0 })));
     for (const player of teams.red) await this.room.command(`!mp team ${player.username} Red`);
     for (const player of teams.blue) await this.room.command(`!mp team ${player.username} Blue`);
-    await this.room.say(`Random event: ${event.label} (unranked). Balanced teams assigned based on ELO.`);
+    await this.room.say(`Random event: ${event.label} (unranked). Balanced teams assigned based on points.`);
   }
+
   private async launch(mapId: number) {
     const gameMode = (await this.osu.beatmap(mapId)).mode;
-    await this.beginMatch(mapId, gameMode); await this.room.command("!mp start"); }
-  /** Covers bot-started games and games started directly by the current host. */
+    await this.beginMatch(mapId, gameMode);
+    await this.room.command("!mp start");
+  }
+
   private async beginMatch(mapId = this.room.beatmapId(), gameMode?: GameMode) {
     if (this.matchId) return;
     this.clearTurnTimer();
-    // Keep a start-of-match roster so disconnects remain in the rating result.
     this.matchParticipants = this.room.players();
     this.matchGameMode = gameMode ?? this.selectedGameMode ?? this.config.regulations.gameMode ?? "osu";
-    this.matchId = (await this.db.match.create({ data: { lobbyId: this.lobbyId, beatmapId: mapId, gameMode: this.matchGameMode, teamEvent: this.teamEvent, startedAt: new Date() } })).id;
-    this.activeBeatmapId = mapId; this.startedAt = new Date(); this.votes.clear(); this.reapplyTitle(); this.reapplyPassword();
+    this.matchId = 1;
+    this.activeBeatmapId = mapId;
+    this.startedAt = new Date();
+    this.votes.clear();
+    this.reapplyTitle();
+    this.reapplyPassword();
   }
-  private stopTimer() { if (this.timer) clearTimeout(this.timer); this.timer = undefined; }
-  private async announceEloChanges(mode: GameMode, changes: string[]) {
-    if (!changes.length) return;
-    const heading = `ELO changes (${gameModeLabel(mode)}): `;
-    let message = heading;
-    for (const change of changes) {
-      const next = message === heading ? `${message}${change}` : `${message} | ${change}`;
-      if (next.length > 400 && message !== heading) {
-        await this.room.say(message);
-        message = `${heading}${change}`;
-      } else message = next;
-    }
-    await this.room.say(message);
+
+  private stopTimer() {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
   }
+
   private async announceSelectedMap(map: MapInfo) {
     if (this.matchId || this.lastAnnouncedMapId === map.id || !this.room.host()) return;
     this.lastAnnouncedMapId = map.id;
@@ -353,77 +497,93 @@ export class LobbyController {
     const mirrorLink = `https://beatconnect.io/b/${map.beatmapsetId}/`;
     await this.room.say(`Selected map: ${name} | ${map.stars.toFixed(2)}★ | ${fmt(map.length)} | [${mirrorLink} Beatconnect Mirror]`);
   }
+
   private async finish(scores: Array<{ player: Participant; score: number; team?: "red" | "blue" }>) {
     if (!this.matchId) return;
-    const matchId = this.matchId; const ordered = [...scores].sort((a, b) => b.score - a.score);
+    const ordered = [...scores].sort((a, b) => b.score - a.score);
     const gameMode = this.matchGameMode ?? this.selectedGameMode ?? this.config.regulations.gameMode ?? "osu";
     const resultByPlayer = new Map(ordered.map(result => [result.player.id, result]));
     const participantById = new Map(this.matchParticipants.map(player => [player.id, player]));
     for (const result of ordered) participantById.set(result.player.id, result.player);
     const participants = [...participantById.values()];
-    const savedStats = await this.db.playerModeStats.findMany({ where: { playerId: { in: participants.map(player => player.id) }, mode: gameMode } });
-    const statsByPlayer = new Map(savedStats.map(stat => [stat.playerId, stat]));
-    const ratingInputs = participants.flatMap(player => {
-      const score = resultByPlayer.get(player.id)?.score;
-      const stats = statsByPlayer.get(player.id);
-      return [{ playerId: player.id, currentElo: stats?.elo ?? 1000, matchCount: stats?.matches ?? 0, score: score === undefined || score === null || score === -1 ? null : score }];
+
+    const rawScores: RawPlayerScore[] = participants.map(player => {
+      const result = resultByPlayer.get(player.id);
+      const score = result?.score;
+      return {
+        playerId: player.id,
+        username: player.username,
+        score: score === undefined || score === null || score === -1 ? 0 : score
+      };
     });
-    const ranked = this.config.ranked && !this.eventActive && ratingInputs.length > 1 ? fractionalElo(ratingInputs) : [];
-    const ratingByPlayer = new Map(ranked.map(result => [result.playerId, result]));
-    const highestCompletedScore = Math.max(...ratingInputs.map(result => result.score ?? -1));
-    for (const player of participants) {
-      const result = resultByPlayer.get(player.id); const rating = ratingByPlayer.get(player.id);
-      const score = result?.score ?? -1; const winner = Boolean(rating && score >= 0 && score === highestCompletedScore);
-      const saved = statsByPlayer.get(player.id);
-      await this.db.$transaction([
-        this.db.score.create({ data: { matchId, playerId: player.id, score, placement: rating ? Math.floor(rating.rank) : ordered.findIndex(entry => entry.player.id === player.id) + 1, team: result?.team, winner } }),
-        ...(rating ? [this.db.playerModeStats.upsert({ where: { playerId_mode: { playerId: player.id, mode: gameMode } }, create: { playerId: player.id, mode: gameMode, elo: rating.newElo, matches: 1, wins: winner ? 1 : 0, streak: winner ? 1 : 0, longestStreak: winner ? 1 : 0 }, update: { elo: rating.newElo, matches: { increment: 1 }, wins: { increment: winner ? 1 : 0 }, streak: winner ? { increment: 1 } : 0, longestStreak: winner ? Math.max(saved?.longestStreak ?? 0, (saved?.streak ?? 0) + 1) : saved?.longestStreak ?? 0 } })] : [])
-      ]);
+
+    const ranked = this.config.ranked && !this.eventActive && rawScores.length > 1;
+    if (ranked) {
+      const evaluated = evaluateRoundScores(rawScores);
+      await persistMatchPoints(this.db, {
+        lobbyId: this.lobbyId,
+        beatmapId: this.activeBeatmapId,
+        minigameId: "party-round",
+        gameMode,
+        results: evaluated
+      });
+
+      const summary = evaluated.map(r => `#${r.placement} ${r.username} (+${r.pointsEarned} pts)`).join(" | ");
+      await this.room.say(`🏆 Results: ${summary}`);
+    } else if (!this.config.ranked) {
+      await this.room.say("This lobby is unranked; no points or competitive stats were applied.");
+    } else if (this.eventActive) {
+      await this.room.say("This random event was unranked; no points were applied.");
+    } else if (rawScores.length <= 1) {
+      await this.room.say("No points were applied: at least two players are required for a ranked match.");
     }
-    if (ranked.length) {
-      await this.announceEloChanges(gameMode, participants.flatMap(player => {
-        const rating = ratingByPlayer.get(player.id);
-        return rating ? [`${player.username} ${rating.eloChange >= 0 ? "+" : ""}${rating.eloChange} (${rating.newElo})`] : [];
-      }));
-    } else if (!this.config.ranked) await this.room.say("This lobby is unranked; no ELO changes or competitive stats were applied.");
-    else if (this.eventActive) await this.room.say("This random event was unranked; no ELO changes were applied.");
-    else if (ratingInputs.length === 1) await this.room.say("No ELO changes were applied: at least two players are required for a ranked match.");
-    await this.db.match.update({ where: { id: this.matchId }, data: { endedAt: new Date() } });
-    const mapId = this.activeBeatmapId; const startedAt = this.startedAt; const leaderboardParticipants = ordered.map(x => ({ ...x.player, matchScore: x.score }));
-    this.matchId = undefined; this.activeBeatmapId = undefined; this.matchGameMode = undefined; this.startedAt = undefined; this.matchParticipants = [];
+
+    const mapId = this.activeBeatmapId;
+    const startedAt = this.startedAt;
+    const leaderboardParticipants = ordered.map(x => ({ ...x.player, matchScore: x.score }));
+    this.matchId = undefined;
+    this.activeBeatmapId = undefined;
+    this.matchGameMode = undefined;
+    this.startedAt = undefined;
+    this.matchParticipants = [];
     if (mapId && startedAt) setTimeout(() => this.runActivity("Leaderboard-score check", () => this.announceLeaderboardScores(mapId, startedAt, leaderboardParticipants)), 10_000);
-    if (this.eventActive) { this.eventActive = false; await this.setLobbyMode(this.config.teamMode, this.config.scoreMode); this.teamEvent = false; }
-    await this.skip(); }
+    if (this.eventActive) {
+      this.eventActive = false;
+      await this.setLobbyMode(this.config.teamMode, this.config.scoreMode);
+      this.teamEvent = false;
+    }
+    await this.skip();
+  }
+
   private async announceLeaderboardScores(mapId: number, startedAt: Date, players: Array<Participant & { matchScore: number }>) {
-    // Newly-submitted scores can take longer than a few seconds to appear in
-    // the public API. Retry for two minutes, while still requiring this exact
-    // match score to be in the map's top 50.
     await Promise.all(players.map(player => this.announceLeaderboardScore(mapId, startedAt, player)));
   }
+
   private async announceLeaderboardScore(mapId: number, startedAt: Date, player: Participant & { matchScore: number }) {
     for (let attempt = 0; attempt < 12; attempt++) {
       try {
         const result = await this.osu.userBeatmapBestScore(mapId, player.id);
         const recordedAt = result?.score.created_at ? Date.parse(result.score.created_at) : NaN;
         const globalPosition = result ? await this.osu.leaderboardPosition(mapId, result.score.id) : undefined;
-        // Ignore a player's existing leaderboard score: it must have been set in this match.
         if (!result || !globalPosition || globalPosition > 50 || !Number.isFinite(recordedAt) || recordedAt < startedAt.getTime() - 120_000) {
           if (attempt < 11) await new Promise(resolve => setTimeout(resolve, 10_000));
           continue;
         }
-        const score = result.score; const points = score.legacy_total_score || score.total_score || score.score || 0;
+        const score = result.score;
+        const points = score.legacy_total_score || score.total_score || score.score || 0;
         if (points !== player.matchScore) {
           if (attempt < 11) await new Promise(resolve => setTimeout(resolve, 10_000));
           continue;
         }
-        const mods = (score.mods ?? []).map(m => typeof m === "string" ? m : m.acronym ?? "").filter(Boolean).join("") || "NM";
+        const mods = (score.mods ?? []).map(m => (typeof m === "string" ? m : m.acronym ?? "")).filter(Boolean).join("") || "NM";
         const pp = score.pp == null ? "" : ` (${score.pp.toFixed(2)}pp)`;
         await this.room.say(`Congratulations ${player.username}! Your ${points.toLocaleString()} +${mods}${pp} score is now global #${globalPosition} on this map!`);
         return;
-      } catch { /* A delayed leaderboard lookup should never disrupt lobby rotation. */ }
+      } catch { /* Suppress temporary API latency */ }
       if (attempt < 11) await new Promise(resolve => setTimeout(resolve, 10_000));
     }
   }
+
   private async playtime(p: Participant, username?: string) {
     const player = username
       ? (await this.db.player.findMany({ where: { username: { contains: username } }, take: 10 })).find(candidate => candidate.username.toLowerCase() === username.toLowerCase())
@@ -433,17 +593,26 @@ export class LobbyController {
     if (!session) return void this.room.say(`${player.username}: no active session in this lobby.`);
     await this.room.say(`${player.username}: session ${fmtSession(Math.floor((Date.now() - session.sessionStart.getTime()) / 1000))}.`);
   }
-  private async timeleft() { if (!this.startedAt || !this.room.beatmapId()) return void this.room.say("No active match."); const map = await this.osu.beatmap(this.room.beatmapId()!); await this.room.say(`About ${fmt(Math.max(0, map.length - Math.floor((Date.now() - this.startedAt.getTime()) / 1000)))} left.`); }
+
+  private async timeleft() {
+    if (!this.startedAt || !this.room.beatmapId()) return void this.room.say("No active match.");
+    const map = await this.osu.beatmap(this.room.beatmapId()!);
+    await this.room.say(`About ${fmt(Math.max(0, map.length - Math.floor((Date.now() - this.startedAt.getTime()) / 1000)))} left.`);
+  }
+
   private currentStatsMode() { return this.selectedGameMode ?? this.config.regulations.gameMode ?? "osu"; }
+
   private parseGameMode(value?: string): GameMode | undefined {
     const aliases: Record<string, GameMode> = { osu: "osu", std: "osu", standard: "osu", taiko: "taiko", fruits: "fruits", catch: "fruits", ctb: "fruits", mania: "mania" };
     return value ? aliases[value.toLowerCase()] : undefined;
   }
+
   private usernameAndMode(args: string[]) {
     const mode = this.parseGameMode(args.at(-1));
     const username = (mode ? args.slice(0, -1) : args).join(" ").trim() || undefined;
     return { username, mode };
   }
+
   private async stats(p: Participant, username?: string, requestedMode?: GameMode) {
     const player = username
       ? (await this.db.player.findMany({ where: { username: { contains: username } }, take: 10 })).find(candidate => candidate.username.toLowerCase() === username.toLowerCase())
@@ -452,18 +621,25 @@ export class LobbyController {
     const mode = requestedMode ?? this.currentStatsMode();
     const stats = await this.db.playerModeStats.findUnique({ where: { playerId_mode: { playerId: player.id, mode } } });
     if (!stats) return void this.room.say(`${player.username}: no ${gameModeLabel(mode)} local stats found yet.`);
-    await this.room.say(`${player.username} (${gameModeLabel(mode)}): ELO ${stats.elo}, LWS ${stats.longestStreak}, matches ${stats.matches}, win rate ${winRate(stats)}%.`);
+    await this.room.say(`${player.username} (${gameModeLabel(mode)}): ${stats.points} pts, LWS ${stats.longestStreak}, matches ${stats.matches}, win rate ${winRate(stats)}%.`);
   }
+
   private async top(args: string[]) {
     const local = args.some(arg => arg.toLowerCase() === "local");
     const modeArgs = args.filter(arg => arg.toLowerCase() !== "local");
-    if (modeArgs.length > 1 || modeArgs.length === 1 && !this.parseGameMode(modeArgs[0])) return void this.room.say("Usage: !top [local] [osu|taiko|catch|mania].");
+    if (modeArgs.length > 1 || (modeArgs.length === 1 && !this.parseGameMode(modeArgs[0]))) return void this.room.say("Usage: !top [local] [osu|taiko|catch|mania].");
     const playerIds = this.room.players().map(player => player.id);
     const mode = this.parseGameMode(modeArgs[0]) ?? this.currentStatsMode();
-    const players = await this.db.playerModeStats.findMany({ where: { mode, matches: { gte: 3 }, ...(local ? { playerId: { in: playerIds } } : {}) }, include: { player: true }, orderBy: [{ elo: "desc" }, { playerId: "asc" }], take: 10 });
+    const players = await this.db.playerModeStats.findMany({
+      where: { mode, matches: { gte: 3 }, ...(local ? { playerId: { in: playerIds } } : {}) },
+      include: { player: true },
+      orderBy: [{ points: "desc" }, { playerId: "asc" }],
+      take: 10
+    });
     if (!players.length) return void this.room.say(local ? `No current lobby players have completed the 3 ${gameModeLabel(mode)} matches required for local rankings yet.` : `No players have completed the 3 ${gameModeLabel(mode)} matches required for local rankings yet.`);
-    await this.room.say(`${local ? "Local top" : "Top"} (${gameModeLabel(mode)}): ${players.map((player, index) => `#${index + 1} ${player.player.username} (${player.elo})`).join(" | ")}`);
+    await this.room.say(`${local ? "Local top" : "Top"} (${gameModeLabel(mode)}): ${players.map((entry, index) => `#${index + 1} ${entry.player.username} (${entry.points} pts)`).join(" | ")}`);
   }
+
   private async rank(p: Participant, username?: string, requestedMode?: GameMode) {
     const player = username
       ? (await this.db.player.findMany({ where: { username: { contains: username } }, take: 10 })).find(candidate => candidate.username.toLowerCase() === username.toLowerCase())
@@ -473,13 +649,25 @@ export class LobbyController {
     const stats = await this.db.playerModeStats.findUnique({ where: { playerId_mode: { playerId: player.id, mode } } });
     if (!stats || stats.matches < 3) return void this.room.say(`${player.username}: complete at least 3 ${gameModeLabel(mode)} matches to receive a local ranking.`);
     const eligible = { mode, matches: { gte: 3 } };
-    const ahead = await this.db.playerModeStats.count({ where: { AND: [eligible, { OR: [{ elo: { gt: stats.elo } }, { elo: stats.elo, playerId: { lt: player.id } }] }] } });
+    const ahead = await this.db.playerModeStats.count({
+      where: { AND: [eligible, { OR: [{ points: { gt: stats.points } }, { points: stats.points, playerId: { lt: player.id } }] }] }
+    });
     const total = await this.db.playerModeStats.count({ where: eligible });
-    await this.room.say(`${player.username}: ${gameModeLabel(mode)} AHR rank #${ahead + 1} of ${total} (ELO ${stats.elo}).`);
+    await this.room.say(`${player.username}: ${gameModeLabel(mode)} rank #${ahead + 1} of ${total} (${stats.points} pts).`);
   }
-  private async lastScore() { const m = await this.db.match.findFirst({ where: { lobbyId: this.lobbyId, endedAt: { not: null } }, orderBy: { endedAt: "desc" }, include: { scores: { include: { player: true }, orderBy: { placement: "asc" } } } }); await this.room.say(m ? `Last: ${m.scores.map(s => `${s.placement}. ${s.player.username} ${s.score}`).join(" | ")}` : "No completed match."); }
+
+  private async lastScore() {
+    const m = await this.db.match.findFirst({
+      where: { lobbyId: this.lobbyId, endedAt: { not: null } },
+      orderBy: { endedAt: "desc" },
+      include: { scores: { include: { player: true }, orderBy: { placement: "asc" } } }
+    });
+    await this.room.say(m ? `Last: ${m.scores.map(s => `${s.placement}. ${s.player.username}${s.score}`).join(" | ")}` : "No completed match.");
+  }
+
   private async bestScore(p: Participant, username?: string) {
-    const id = this.room.beatmapId(); if (!id) return void this.room.say("Select a beatmap first.");
+    const id = this.room.beatmapId();
+    if (!id) return void this.room.say("Select a beatmap first.");
     const map = await this.osu.beatmap(id);
     if (["wip", "pending", "graveyard"].includes(map.status)) return void this.room.say(`!bestscore is unavailable: ${map.status} maps do not have global leaderboards.`);
     let target = p;
@@ -493,22 +681,28 @@ export class LobbyController {
     const result = await this.osu.userBeatmapBestScore(id, target.id);
     if (!result) return void this.room.say(`${target.username}: no submitted global score on this beatmap.`);
     const score = result.score;
-    // Lazer scores use total_score; classic scores normally use legacy_total_score.
-    // Some API responses include one of those as 0, so prefer the first non-zero value.
     const points = score.legacy_total_score || score.total_score || score.score || 0;
     const accuracy = score.accuracy === undefined ? "" : `, ${(score.accuracy * 100).toFixed(2)}%`;
     const pp = score.pp == null ? "" : `, ${score.pp.toFixed(2)}pp`;
-    const modAcronyms = (score.mods ?? []).map(m => typeof m === "string" ? m : m.acronym ?? "").filter(Boolean);
+    const modAcronyms = (score.mods ?? []).map(m => (typeof m === "string" ? m : m.acronym ?? "")).filter(Boolean);
     const mods = modAcronyms.length ? ` +${modAcronyms.join("")}` : " +NM";
     const globalPosition = await this.osu.leaderboardPosition(id, score.id);
     await this.room.say(`${target.username}: global best ${points.toLocaleString()}${accuracy}${pp}${mods}${globalPosition ? ` (global #${globalPosition})` : ""}.`);
   }
-  private async order(value: string) { const names = value.split(",").map(x => x.trim().toLowerCase()); const players = await this.db.player.findMany({ where: { id: { in: this.queue } } }); this.queue = names.map(n => players.find(p => p.username.toLowerCase() === n)?.id).filter((x): x is number => x !== undefined); await this.showQueue(); }
-  private async resetElo(confirmation?: string) {
-    if (confirmation?.toLowerCase() !== "confirm") return void this.room.say("This resets every player's competitive stats. Use *resetelo confirm to proceed.");
-    const result = await this.db.playerModeStats.updateMany({ data: { elo: 1000, matches: 0, wins: 0, streak: 0, longestStreak: 0 } });
-    await this.room.say(`ELO rankings reset for ${result.count} player${result.count === 1 ? "" : "s"}.`);
+
+  private async order(value: string) {
+    const names = value.split(",").map(x => x.trim().toLowerCase());
+    const players = await this.db.player.findMany({ where: { id: { in: this.queue } } });
+    this.queue = names.map(n => players.find(p => p.username.toLowerCase() === n)?.id).filter((x): x is number => x !== undefined);
+    await this.showQueue();
   }
+
+  private async resetPoints(confirmation?: string) {
+    if (confirmation?.toLowerCase() !== "confirm") return void this.room.say("This resets every player's competitive stats. Use *resetelo confirm to proceed.");
+    const result = await this.db.playerModeStats.updateMany({ data: { points: 0, matches: 0, wins: 0, streak: 0, longestStreak: 0 } });
+    await this.room.say(`Rankings reset for ${result.count} player${result.count === 1 ? "" : "s"}.`);
+  }
+
   private async kick(username: string) {
     if (!username) return void this.room.say("Usage: *kick [username].");
     const player = this.room.players().find(candidate => candidate.username.toLowerCase() === username.toLowerCase());
@@ -516,12 +710,15 @@ export class LobbyController {
     await this.room.command(`!mp kick ${player.username}`);
     await this.room.say(`${player.username} was removed from the lobby by an administrator.`);
   }
+
   private async closeLobby() {
     this.closeRequested = true;
-    this.stopTimer(); this.clearTurnTimer();
+    this.stopTimer();
+    this.clearTurnTimer();
     await this.room.say("This lobby is being closed by an administrator.");
     await this.room.command("!mp close");
   }
+
   private async setEventChance(value?: string) {
     const percent = Number(value);
     if (!Number.isFinite(percent) || percent < 0 || percent > 100) return void this.room.say("Usage: *eventchance [0-100].");
@@ -529,18 +726,22 @@ export class LobbyController {
     await this.persist();
     await this.room.say(`Random event chance set to ${percent}%.`);
   }
+
   private async setRanked(value?: string) {
     const enabled = value?.toLowerCase();
     if (enabled !== "on" && enabled !== "off") return void this.room.say("Usage: *ranked [on/off].");
     this.config.ranked = enabled === "on";
     await this.persist();
-    await this.room.say(`Lobby ranking is now ${this.config.ranked ? "enabled — matches count toward ELO and stats." : "disabled — matches are unranked and do not count toward ELO or stats."}`);
+    await this.room.say(`Lobby ranking is now ${this.config.ranked ? "enabled — matches count toward PartyPoints and stats." : "disabled — matches are unranked and do not count toward PartyPoints or stats."}`);
   }
+
   async close() { await this.closeLobby(); await this.removeEmptyHistory(); }
+
   private async removeEmptyHistory() {
     const matches = await this.db.match.count({ where: { lobbyId: this.lobbyId } });
     if (matches === 0) await this.db.lobby.delete({ where: { id: this.lobbyId } }).catch(() => undefined);
   }
+
   async updateRegulations(regulations: Partial<LobbyConfig["regulations"]>, eventChance?: number, details?: { title?: string; password?: string; removePassword?: boolean; ranked?: boolean; autoRecreateOnInactivity?: boolean }) {
     this.config.regulations = { ...DEFAULT_CONFIG.regulations, ...regulations };
     if (eventChance !== undefined) this.config.eventChance = eventChance;
@@ -558,17 +759,64 @@ export class LobbyController {
     await this.db.lobby.update({ where: { id: this.lobbyId }, data: { name: this.config.title, password: this.config.password, config: this.config as any } });
     await this.room.say(`Lobby settings updated from the dashboard. ${this.regulationSummary()} Random events: ${(this.config.eventChance * 100).toFixed(0)}%. Ranking: ${this.config.ranked ? "enabled" : "disabled"}.`);
   }
-  private async updateMap() { const id = this.room.beatmapId(); if (!id) return void this.room.say("Select a beatmap first."); const map = await this.osu.beatmap(id); await this.room.command(`!mp map ${map.id}`); await this.room.say(`Map refreshed: ${map.version}.`); }
-  private async keep(a: string[]) {
-    const [kind, ...rest] = a; let confirmation = "";
-    if (kind === "size") { const size = Number(rest[0]); if (!Number.isInteger(size) || size < 1 || size > 16) return void this.room.say("Lobby size must be 1-16."); this.config.size = size; this.config.locks.size = true; await this.room.command(`!mp size ${size}`); confirmation = `Lobby size locked to ${size}.`; }
-    if (kind === "password") { if (!this.config.password) return void this.room.say("This lobby was created passwordless, so password locking is not allowed."); const password = rest.join(" "); if (!password) return void this.room.say("Usage: *keep password [password]."); this.config.password = password; this.config.locks.password = true; this.passwordSetUntil = Date.now() + 3_000; await this.room.command(`!mp password ${password}`); confirmation = "Lobby password lock enabled."; }
-    if (kind === "mods") { this.config.mods = rest; this.config.locks.mods = true; await this.room.command(`!mp mods ${rest.join(" ")}`); confirmation = `Mod lock enabled: ${rest.join(" ") || "None"}.`; }
-    if (kind === "title") { const title = rest.join(" "); if (!title) return void this.room.say("Usage: *keep title [title]."); this.config.title = title; this.config.locks.title = true; await this.room.setTitle(title); confirmation = `Lobby title locked to: ${title}.`; }
-    if (!confirmation) return void this.room.say("Unknown lobby lock. Use size, password, mods, or title.");
-    await this.persist(); await this.room.say(confirmation);
+
+  private async updateMap() {
+    const id = this.room.beatmapId();
+    if (!id) return void this.room.say("Select a beatmap first.");
+    const map = await this.osu.beatmap(id);
+    await this.room.command(`!mp map ${map.id}`);
+    await this.room.say(`Map refreshed: ${map.version}.`);
   }
-  private async noKeep(kind?: string) { if (kind === "mod") kind = "mods"; if (!kind || !["size", "password", "mods", "title"].includes(kind)) return void this.room.say("Unknown lobby lock. Use size, password, mods, or title."); const wasLocked = Boolean(this.config.locks[kind as keyof LobbyConfig["locks"]]); delete this.config.locks[kind as keyof LobbyConfig["locks"]]; await this.persist(); await this.room.say(wasLocked ? `${kind === "mods" ? "Mod" : kind[0].toUpperCase() + kind.slice(1)} lock removed.` : `${kind === "mods" ? "Mod" : kind[0].toUpperCase() + kind.slice(1)} lock was not enabled.`); }
+
+  private async keep(a: string[]) {
+    const [kind, ...rest] = a;
+    let confirmation = "";
+    if (kind === "size") {
+      const size = Number(rest[0]);
+      if (!Number.isInteger(size) || size < 1 || size > 16) return void this.room.say("Lobby size must be 1-16.");
+      this.config.size = size;
+      this.config.locks.size = true;
+      await this.room.command(`!mp size ${size}`);
+      confirmation = `Lobby size locked to ${size}.`;
+    }
+    if (kind === "password") {
+      if (!this.config.password) return void this.room.say("This lobby was created passwordless, so password locking is not allowed.");
+      const password = rest.join(" ");
+      if (!password) return void this.room.say("Usage: *keep password [password].");
+      this.config.password = password;
+      this.config.locks.password = true;
+      this.passwordSetUntil = Date.now() + 3_000;
+      await this.room.command(`!mp password ${password}`);
+      confirmation = "Lobby password lock enabled.";
+    }
+    if (kind === "mods") {
+      this.config.mods = rest;
+      this.config.locks.mods = true;
+      await this.room.command(`!mp mods ${rest.join(" ")}`);
+      confirmation = `Mod lock enabled: ${rest.join(" ") || "None"}.`;
+    }
+    if (kind === "title") {
+      const title = rest.join(" ");
+      if (!title) return void this.room.say("Usage: *keep title [title].");
+      this.config.title = title;
+      this.config.locks.title = true;
+      await this.room.setTitle(title);
+      confirmation = `Lobby title locked to: ${title}.`;
+    }
+    if (!confirmation) return void this.room.say("Unknown lobby lock. Use size, password, mods, or title.");
+    await this.persist();
+    await this.room.say(confirmation);
+  }
+
+  private async noKeep(kind?: string) {
+    if (kind === "mod") kind = "mods";
+    if (!kind || !["size", "password", "mods", "title"].includes(kind)) return void this.room.say("Unknown lobby lock. Use size, password, mods, or title.");
+    const wasLocked = Boolean(this.config.locks[kind as keyof LobbyConfig["locks"]]);
+    delete this.config.locks[kind as keyof LobbyConfig["locks"]];
+    await this.persist();
+    await this.room.say(wasLocked ? `${kind === "mods" ? "Mod" : kind[0].toUpperCase() + kind.slice(1)} lock removed.` : `${kind === "mods" ? "Mod" : kind[0].toUpperCase() + kind.slice(1)} lock was not enabled.`);
+  }
+
   private async regulation(a: string[]) {
     if (a[0] === "enable") this.config.regulations.enabled = true;
     else if (a[0] === "disable") this.config.regulations.enabled = false;
@@ -591,8 +839,19 @@ export class LobbyController {
         }
       }
     }
-    await this.persist(); await this.room.say(`Regulations updated. ${this.regulationSummary()}`);
+    await this.persist();
+    await this.room.say(`Regulations updated. ${this.regulationSummary()}`);
   }
-  private async denylist(a: string[]) { const username = a.slice(1).join(" "); if (!["add", "remove"].includes(a[0]) || !username) return void this.room.say("Usage: *denylist add [username] or *denylist remove [username]."); const p = await this.db.player.findFirst({ where: { username: { equals: username } } }); if (!p) return void this.room.say(`${username} is not in this bot's player database yet.`); const denied = a[0] === "add"; await this.db.player.update({ where: { id: p.id }, data: { denied } }); await this.room.say(`${p.username} ${denied ? "added to" : "removed from"} the denylist.`); }
+
+  private async denylist(a: string[]) {
+    const username = a.slice(1).join(" ");
+    if (!["add", "remove"].includes(a[0]) || !username) return void this.room.say("Usage: *denylist add [username] or *denylist remove [username].");
+    const p = await this.db.player.findFirst({ where: { username: { equals: username } } });
+    if (!p) return void this.room.say(`${username} is not in this bot's player database yet.`);
+    const denied = a[0] === "add";
+    await this.db.player.update({ where: { id: p.id }, data: { denied } });
+    await this.room.say(`${p.username} ${denied ? "added to" : "removed from"} the denylist.`);
+  }
+
   private persist() { return this.db.lobby.update({ where: { id: this.lobbyId }, data: { config: this.config as any } }); }
 }
