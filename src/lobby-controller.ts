@@ -4,6 +4,7 @@ import { OsuApiRequestError, type OsuApi } from "./adapters/osu.js";
 import { DEFAULT_CONFIG, gameModeLabel, type GameMode, type LobbyConfig, type MapInfo, type Participant } from "./types.js";
 import { checkMap } from "./services/regulations.js";
 import { evaluateRoundScores, persistMatchPoints, type RawPlayerScore } from "./services/party-scoring.js";
+import { rollNextMinigame, selectTagMapId, getBanchoSetupCommands, type MinigameDefinition } from "./services/party-minigames.js";
 import { balancedTeams } from "./services/teams.js";
 import { VoteBook } from "./services/votes.js";
 
@@ -34,7 +35,7 @@ export class LobbyController {
   private selectedGameMode?: GameMode;
   private matchParticipants: Participant[] = [];
   private teamEvent = false;
-  private eventActive = false;
+  private currentMinigame?: MinigameDefinition;
   private lastValidMapId?: number;
   private lastAnnouncedMapId?: number;
   private passwordSetUntil = 0;
@@ -196,7 +197,7 @@ export class LobbyController {
       });
       return;
     }
-    await this.prepareRoundEvent();
+    await this.prepareNextMinigame();
     this.startTurnTimer("select", host);
   }
 
@@ -444,26 +445,57 @@ export class LobbyController {
 
   private async setLobbyMode(teamMode: number, scoreMode: number) { await this.room.command(`!mp set ${teamMode} ${scoreMode}`); }
 
-  private async prepareRoundEvent() {
-    this.eventActive = Math.random() < this.config.eventChance;
-    this.teamEvent = false;
-    if (!this.eventActive) {
-      await this.setLobbyMode(this.config.teamMode, this.config.scoreMode);
-      return;
+  private async prepareNextMinigame() {
+    // 1. Roll the next minigame
+    this.currentMinigame = rollNextMinigame(this.currentMinigame?.id);
+    this.teamEvent = this.currentMinigame.teamMode === 2 || this.currentMinigame.teamMode === 3;
+
+    // 2. Announce to Bancho Chat
+    await this.room.say(`🎲 Next Minigame: ${this.currentMinigame.name}`);
+    await this.room.say(`📜 ${this.currentMinigame.description}`);
+
+    // 3. Apply Bancho Rules (Mode & Mods)
+    const commands = getBanchoSetupCommands(this.currentMinigame);
+    for (const cmd of commands) {
+      await this.room.command(cmd);
     }
-    const event = RANDOM_EVENTS[Math.floor(Math.random() * RANDOM_EVENTS.length)];
-    this.teamEvent = event.teamMode === 2;
-    await this.setLobbyMode(event.teamMode, event.scoreMode);
-    if (!this.teamEvent) return void this.room.say(`Random event: ${event.label} (unranked).`);
-    const ids = this.room.players().map(player => player.id);
-    const players = await this.db.player.findMany({ where: { id: { in: ids } } });
-    const mode = this.currentStatsMode();
-    const modeStats = await this.db.playerModeStats.findMany({ where: { playerId: { in: ids }, mode } });
-    const pointsByPlayer = new Map(modeStats.map(stat => [stat.playerId, stat.points]));
-    const teams = balancedTeams(players.map(player => ({ ...player, elo: pointsByPlayer.get(player.id) ?? 0 })));
-    for (const player of teams.red) await this.room.command(`!mp team ${player.username} Red`);
-    for (const player of teams.blue) await this.room.command(`!mp team ${player.username} Blue`);
-    await this.room.say(`Random event: ${event.label} (unranked). Balanced teams assigned based on points.`);
+
+    const players = this.room.players();
+
+    // 4. Handle Team Balancing (Clash & Juggernaut)
+    if (this.currentMinigame.teamMode === 2) {
+      const activeIds = players.map(p => p.id);
+      const dbPlayers = await this.db.player.findMany({ where: { id: { in: activeIds } } });
+      const modeStats = await this.db.playerModeStats.findMany({ where: { playerId: { in: activeIds }, mode: this.currentStatsMode() } });
+      const pointsByPlayer = new Map(modeStats.map(stat => [stat.playerId, stat.points]));
+      const hydratedPlayers = dbPlayers.map(p => ({ ...p, elo: pointsByPlayer.get(p.id) ?? 0 }));
+
+      if (this.currentMinigame.scoringMetric === "juggernaut") {
+        hydratedPlayers.sort((a, b) => b.elo - a.elo);
+        const juggernaut = hydratedPlayers[0];
+        if (juggernaut) {
+          await this.room.command(`!mp team ${juggernaut.username} Red`);
+          for (let i = 1; i < hydratedPlayers.length; i++) {
+            await this.room.command(`!mp team ${hydratedPlayers[i].username} Blue`);
+          }
+        }
+      } else {
+        const teams = balancedTeams(hydratedPlayers);
+        for (const player of teams.red) await this.room.command(`!mp team ${player.username} Red`);
+        for (const player of teams.blue) await this.room.command(`!mp team ${player.username} Blue`);
+      }
+    }
+
+    // 5. Handle Map Selection
+    if (this.currentMinigame.mapPicker === "host") {
+      await this.room.say(`👉 Host, please select a map!`);
+    } else if (this.currentMinigame.mapPicker === "bot_tag") {
+      const mapId = selectTagMapId(players.length);
+      await this.room.command(`!mp map ${mapId}`);
+      await this.room.say(`Automated Pick: Tag map selected for ${players.length} players.`);
+    } else if (this.currentMinigame.mapPicker.startsWith("bot_")) {
+      await this.room.say(`[Automated API/Pool Map Picker pending implementation...]`);
+    }
   }
 
   private async launch(mapId: number) {
@@ -517,13 +549,13 @@ export class LobbyController {
       };
     });
 
-    const ranked = this.config.ranked && !this.eventActive && rawScores.length > 1;
+    const ranked = this.config.ranked && rawScores.length > 1;
     if (ranked) {
       const evaluated = evaluateRoundScores(rawScores);
       await persistMatchPoints(this.db, {
         lobbyId: this.lobbyId,
         beatmapId: this.activeBeatmapId,
-        minigameId: "party-round",
+        minigameId: this.currentMinigame?.id ?? "unknown",
         gameMode,
         results: evaluated
       });
@@ -532,8 +564,6 @@ export class LobbyController {
       await this.room.say(`🏆 Results: ${summary}`);
     } else if (!this.config.ranked) {
       await this.room.say("This lobby is unranked; no points or competitive stats were applied.");
-    } else if (this.eventActive) {
-      await this.room.say("This random event was unranked; no points were applied.");
     } else if (rawScores.length <= 1) {
       await this.room.say("No points were applied: at least two players are required for a ranked match.");
     }
@@ -547,11 +577,7 @@ export class LobbyController {
     this.startedAt = undefined;
     this.matchParticipants = [];
     if (mapId && startedAt) setTimeout(() => this.runActivity("Leaderboard-score check", () => this.announceLeaderboardScores(mapId, startedAt, leaderboardParticipants)), 10_000);
-    if (this.eventActive) {
-      this.eventActive = false;
-      await this.setLobbyMode(this.config.teamMode, this.config.scoreMode);
-      this.teamEvent = false;
-    }
+    
     await this.skip();
   }
 
