@@ -64,6 +64,8 @@ export class LobbyController {
   private readonly botUsername?: string;
   private automatedBeatmapId?: number;
   private isPreparingRound = false;
+  private currentForcedMods?: string;
+  private isEnforcingMods = false;
 
   constructor(
     private db: PrismaClient,
@@ -128,6 +130,7 @@ export class LobbyController {
     this.room.onPasswordChanged(() => this.runActivity("Lobby password changed", () => this.enforcePassword()));
     this.room.onHostChanged(host => this.runActivity(`Host changed: ${host?.username ?? "none"}`, () => this.hostChanged(host)));
     this.room.onAllPlayersReady(() => this.runActivity("All players ready", () => this.allPlayersReady()));
+    this.room.onModsChanged?.((mods, freemod) => this.runActivity("Mods changed", () => this.enforceForcedMods(mods, freemod)));
     this.room.onMatchStarted(() => this.runActivity("Match started", () => this.beginMatch()));
     this.room.onMatchFinished(s => this.runActivity(`Match finished: ${s.length} result(s)`, () => this.finish(s)));
     this.room.onClosed(() => {
@@ -165,7 +168,9 @@ export class LobbyController {
       }
     }
 
-    if (this.currentMinigame && this.currentMinigame.forcedMods) {
+    if (this.currentForcedMods) {
+      await this.room.command(`!mp mods ${this.currentForcedMods}`);
+    } else if (this.currentMinigame && this.currentMinigame.forcedMods) {
       await this.room.command(`!mp mods ${this.currentMinigame.forcedMods}`);
     } else if (this.currentMinigame && !this.currentMinigame.forcedMods) {
       await this.room.command("!mp mods freemod");
@@ -391,13 +396,13 @@ export class LobbyController {
     if (["!round", "!cycle"].includes(cmd)) return void this.showRoundInfo();
     if (["!points", "!pts"].includes(cmd)) return void this.showPoints(p);
     if (["!leaderboard", "!standings"].includes(cmd)) return void this.showStandings();
-    if (cmd === "!bug") return void this.room.say("Report a bug: https://github.com/ronaldonater/osu-ahr-bot/issues");
+    if (cmd === "!bug") return void this.room.say("Report a bug: https://github.com/kikidoyouheartme-tech/osu-party-bot/issues");
     if (cmd === "!donate") return void this.room.say("Support the bot: https://ko-fi.com/ronaldonater");
     if (["!regulations"].includes(cmd)) return void this.showRegulations();
     if (["!version", "!v"].includes(cmd)) return void this.room.say("osu-ahr-bot v0.1.22");
     if (["!playtime", "!pt"].includes(cmd)) return void this.playtime(p, value || undefined);
     if (["!timeleft", "!tl"].includes(cmd)) return void this.timeleft();
-    if (["!pstats", "!stats", "!ostats", "!os"].includes(cmd)) { const { username, mode } = this.usernameAndMode(args); return void this.stats(p, username, mode); }
+    if (["!pstats", "!stats"].includes(cmd)) { const { username, mode } = this.usernameAndMode(args); return void this.stats(p, username, mode); }
     if (["!top", "!t"].includes(cmd)) return void this.top(args);
     if (["!how", "!h"].includes(cmd)) return void this.room.say("Ranked Party matches award PartyPoints using the (N - rank) formula. Highest score earns the most points. Unranked matches award no PartyPoints.");
     if (cmd === "!rank") { const { username, mode } = this.usernameAndMode(args); return void this.rank(p, username, mode); }
@@ -407,6 +412,9 @@ export class LobbyController {
     if (cmd === "!autoskip") return void this.setAutoSkip(p, args[0]);
     if (cmd === "!update") return void (this.isHost(p) ? this.updateMap() : this.room.say(`${p.username}: only the current host can use !update.`));
     if (cmd === "!votekick") return void this.voteKick(p, value);
+    if (cmd === "!mp" && args[0] && ["mods", "freemod"].includes(args[0].toLowerCase()) && this.currentForcedMods) {
+      return void this.enforceForcedMods([], true);
+    }
     const force = (args[0] === "force" && admins.has(p.id)) || cmd === "*skip";
     if (cmd === "!skip") return void (this.isHost(p) || admins.has(p.id) ? this.skip(force, true) : this.vote("skip", p));
     if (cmd === "!start") return void (this.isHost(p) ? this.startMatch(Number(args[0] ?? 5)) : this.vote("start", p));
@@ -555,6 +563,9 @@ export class LobbyController {
       const reason = checkMap(await this.osu.beatmap(mapId), this.config.regulations);
       if (reason) return void this.room.say(`Map rejected: ${reason}.`);
     }
+    if (this.currentForcedMods) {
+      await this.room.command(`!mp mods ${this.currentForcedMods}`);
+    }
     this.clearTurnTimer();
     this.stopTimer();
     this.timer = setTimeout(() => this.runActivity("Match launch", () => this.launch(mapId)), seconds * 1000);
@@ -580,6 +591,9 @@ export class LobbyController {
         this.selectedGameMode = map.mode;
         await this.announceSelectedMap(map);
         this.mapSelected(mapId);
+        if (this.currentForcedMods) {
+          await this.room.command(`!mp mods ${this.currentForcedMods}`);
+        }
         return;
       }
       if (this.lastValidMapId) {
@@ -622,6 +636,34 @@ export class LobbyController {
     await this.room.say("Lobby password is locked and has been restored.");
   }
 
+  private async enforceForcedMods(currentMods?: string[], isFreemod?: boolean) {
+    const requiredMods = this.currentForcedMods ?? (this.config.locks.mods ? this.config.mods.join(" ") : undefined);
+    if (!requiredMods || this.isEnforcingMods) return;
+    const expectedTokens = requiredMods.toUpperCase().split(/\s+/).filter(Boolean).sort();
+    const expectedNormalized = expectedTokens.join(" ");
+    const currentTokens = (currentMods ?? this.room.mods?.() ?? [])
+      .map(m => m.toUpperCase())
+      .filter(m => m !== "NONE")
+      .sort();
+    const currentNormalized = currentTokens.join(" ");
+    const freemodActive = isFreemod !== undefined ? isFreemod : (this.room.freemod?.() ?? false);
+
+    if (currentNormalized !== expectedNormalized || freemodActive) {
+      this.isEnforcingMods = true;
+      try {
+        await this.room.command(`!mp mods ${requiredMods}`);
+        const lockMsg = this.currentForcedMods
+          ? `[Lock] Mods are locked for this minigame (${requiredMods}).`
+          : `[Lock] Lobby mod lock is active (${requiredMods}).`;
+        await this.room.say(lockMsg);
+      } finally {
+        setTimeout(() => {
+          this.isEnforcingMods = false;
+        }, 1500);
+      }
+    }
+  }
+
   private async setLobbyMode(teamMode: number, scoreMode: number) { await this.room.command(`!mp set ${teamMode} ${scoreMode}`); }
 
   private async prepareNextMinigame() {
@@ -642,6 +684,7 @@ export class LobbyController {
       }
 
       // 3. Apply Bancho Rules (Mode & Mods)
+      this.currentForcedMods = this.currentMinigame.forcedMods || undefined;
       const commands = getBanchoSetupCommands(this.currentMinigame);
       for (const cmd of commands) {
         await this.room.command(cmd);
@@ -715,6 +758,7 @@ export class LobbyController {
         if (picked) {
           this.automatedBeatmapId = picked.beatmapId;
           if (picked.overrideMods) {
+            this.currentForcedMods = picked.overrideMods;
             await this.room.command(`!mp mods ${picked.overrideMods}`);
           }
           await this.room.command(`!mp map ${picked.beatmapId}`);
@@ -743,11 +787,14 @@ export class LobbyController {
     }
   }
 
-private async launch(mapId: number) {
-  const gameMode = (await this.osu.beatmap(mapId)).mode;
-  await this.beginMatch(mapId, gameMode);
-  await this.room.command("!mp start");
-}
+  private async launch(mapId: number) {
+    if (this.currentForcedMods) {
+      await this.room.command(`!mp mods ${this.currentForcedMods}`);
+    }
+    const gameMode = (await this.osu.beatmap(mapId)).mode;
+    await this.beginMatch(mapId, gameMode);
+    await this.room.command("!mp start");
+  }
 
   private async beginMatch(mapId = this.room.beatmapId(), gameMode?: GameMode) {
     if (this.matchId) return;

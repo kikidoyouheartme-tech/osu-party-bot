@@ -105,7 +105,7 @@ Commands are case-insensitive. Username parameters can include spaces, and <code
 | <code>!abort</code> | Vote to abort the active match |
 | <code>!votekick [username]</code> | Vote to remove a player from the lobby |
 | <code>!regulations</code> | Show the active map regulations |
-| <code>!ostats [username] [mode]</code> | Show local ELO and match statistics |
+| <code>!pstats [username] [mode]</code> | Show local PartyPoints and match statistics |
 | <code>!rank [username] [mode]</code> | Show a player's local ranking |
 | <code>!top [local] [mode]</code> | View the local or global ELO leaderboard |
 | <code>!playtime</code> or <code>!pt [username]</code> | Show the current lobby-session playtime |

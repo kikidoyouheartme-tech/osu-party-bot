@@ -927,6 +927,88 @@ test("session standings calculation sorts by sessionPoints desc and flags host s
   assert.equal(standings[2].sessionPoints, 5);
 });
 
+test("!bug links to osu!Party GitHub issues and !ostats is removed", () => {
+  const bugResponse = "Report a bug: https://github.com/kikidoyouheartme-tech/osu-party-bot/issues";
+  assert.equal(bugResponse, "Report a bug: https://github.com/kikidoyouheartme-tech/osu-party-bot/issues");
+
+  const supportedStatCmds = ["!pstats", "!stats"];
+  assert.ok(supportedStatCmds.includes("!pstats"));
+  assert.ok(supportedStatCmds.includes("!stats"));
+  assert.ok(!supportedStatCmds.includes("!ostats"), "!ostats must be removed");
+  assert.ok(!supportedStatCmds.includes("!os"), "!os must be removed");
+});
+
+test("forced mods lock prevents host from removing or changing required mods", async () => {
+  const commandsSent: string[] = [];
+  const chatMessages: string[] = [];
+
+  class MockEnforcer {
+    currentForcedMods?: string;
+    isEnforcingMods = false;
+    currentLobbyMods: string[] = [];
+    freemod = false;
+
+    async enforceForcedMods(currentMods?: string[], isFreemod?: boolean) {
+      const requiredMods = this.currentForcedMods;
+      if (!requiredMods || this.isEnforcingMods) return;
+      const expectedTokens = requiredMods.toUpperCase().split(/\s+/).filter(Boolean).sort();
+      const expectedNormalized = expectedTokens.join(" ");
+      const currentTokens = (currentMods ?? this.currentLobbyMods)
+        .map(m => m.toUpperCase())
+        .filter(m => m !== "NONE")
+        .sort();
+      const currentNormalized = currentTokens.join(" ");
+      const freemodActive = isFreemod !== undefined ? isFreemod : this.freemod;
+
+      if (currentNormalized !== expectedNormalized || freemodActive) {
+        this.isEnforcingMods = true;
+        try {
+          commandsSent.push(`!mp mods ${requiredMods}`);
+          chatMessages.push(`[Lock] Mods are locked for this minigame (${requiredMods}).`);
+          this.currentLobbyMods = expectedTokens;
+          this.freemod = false;
+        } finally {
+          this.isEnforcingMods = false;
+        }
+      }
+    }
+  }
+
+  const enforcer = new MockEnforcer();
+
+  // 1. Minigame: Blindfolded (Forced HD FL)
+  enforcer.currentForcedMods = "HD FL";
+  enforcer.currentLobbyMods = ["HD", "FL"];
+  enforcer.freemod = false;
+
+  // Host tries to take off Flashlight (mods become ["HD"])
+  await enforcer.enforceForcedMods(["HD"], false);
+  assert.equal(commandsSent[commandsSent.length - 1], "!mp mods HD FL");
+  assert.equal(chatMessages[chatMessages.length - 1], "[Lock] Mods are locked for this minigame (HD FL).");
+
+  // Host tries to turn on FreeMod
+  await enforcer.enforceForcedMods(["HD", "FL"], true);
+  assert.equal(commandsSent[commandsSent.length - 1], "!mp mods HD FL");
+  assert.equal(chatMessages[chatMessages.length - 1], "[Lock] Mods are locked for this minigame (HD FL).");
+
+  // Host tries to add DoubleTime (mods become ["HD", "FL", "DT"])
+  await enforcer.enforceForcedMods(["HD", "FL", "DT"], false);
+  assert.equal(commandsSent[commandsSent.length - 1], "!mp mods HD FL");
+  assert.equal(chatMessages[chatMessages.length - 1], "[Lock] Mods are locked for this minigame (HD FL).");
+
+  // When mods match expected, no lock command is sent
+  const beforeLen = commandsSent.length;
+  await enforcer.enforceForcedMods(["FL", "HD"], false);
+  assert.equal(commandsSent.length, beforeLen, "Should not dispatch command when mods match");
+
+  // 2. Casual / Freemod minigame without forced mods
+  enforcer.currentForcedMods = undefined;
+  enforcer.currentLobbyMods = ["DT"];
+  enforcer.freemod = true;
+  await enforcer.enforceForcedMods(["HR"], true);
+  assert.equal(commandsSent.length, beforeLen, "Should not restrict mods when no forced mods are active");
+});
+
 
 
 

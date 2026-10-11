@@ -20,6 +20,9 @@ export interface RoomActions {
   players(): Participant[]; host(): Participant | undefined; beatmapId(): number | undefined;
   id(): number;
   botUsername?(): string | undefined;
+  mods?(): string[];
+  freemod?(): boolean;
+  onModsChanged?(listener: (mods: string[], freemod: boolean) => void): void;
   onMessage(listener: (sender: Participant, text: string) => void): void;
   onPlayerJoined(listener: (player: Participant) => void): void;
   onPlayerLeft(listener: (player: Participant) => void): void;
@@ -106,6 +109,26 @@ class BanchoRoom implements RoomActions {
   beatmapId() { return this.channel.lobby?.beatmapId; }
   id() { return this.channel.lobby.id; }
   botUsername(): string | undefined { return this.channel.banchojs?.username ?? this.channel.client?.username; }
+  mods(): string[] {
+    return (this.channel.lobby?.mods ?? [])
+      .map((m: any) => m?.shortMod || m?.acronym || String(m))
+      .filter((s: string) => Boolean(s) && s.toLowerCase() !== "none");
+  }
+  freemod(): boolean {
+    return Boolean(this.channel.lobby?.freemod);
+  }
+  onModsChanged(listener: (mods: string[], freemod: boolean) => void) {
+    const handle = () => listener(this.mods(), this.freemod());
+    this.channel.lobby?.on("mods", handle);
+    this.channel.lobby?.on("freemod", handle);
+    this.channel.lobby?.on("refereeChangedMods", handle);
+    this.channel.on("message", (message: any) => {
+      if (message.user?.ircUsername?.toLowerCase() !== "banchobot") return;
+      if (/^(Enabled|Disabled|Active mods:)/i.test(message.message)) {
+        setTimeout(handle, 100);
+      }
+    });
+  }
   onMessage(listener: (sender: Participant, text: string) => void) { this.channel.on("message", (m: any) => { const player = this.participant(m?.user, "Chat message"); if (player) listener(player, m.message); }); }
   onPlayerJoined(listener: (player: Participant) => void) { this.channel.lobby.on("playerJoined", (e: any) => { const player = this.participant(e?.player?.user, "Player join"); if (player) { if (e?.player?.team) player.team = e.player.team.toLowerCase() === "blue" ? "Blue" : "Red"; listener(player); } }); }
   onPlayerLeft(listener: (player: Participant) => void) { this.channel.lobby.on("playerLeft", (player: any) => { const participant = this.participant(player?.user, "Player leave"); if (participant) listener(participant); }); }
