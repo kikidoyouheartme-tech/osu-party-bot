@@ -2,7 +2,7 @@
   <img src="public/logo.png" width="148" alt="osu!Party">
 </p>
 
-<h1 align="center">osu! Auto Host Rotate Bot</h1>
+<h1 align="center">osu!Party</h1>
 
 <p align="center">
   A self-hosted Bancho multiplayer referee bot with fair local ELO, automatic host rotation, map regulations, and a local lobby dashboard.
