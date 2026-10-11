@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/NextUp.svg" width="148" alt="NextUp!">
+  <img src="assets/logo.png" width="148" alt="NextUp!">
 </p>
 
 <h1 align="center">osu! Auto Host Rotate Bot</h1>
