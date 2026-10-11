@@ -13,15 +13,19 @@ export interface Regulations {
 }
 export interface LobbyConfig {
   title: string; size?: number; password?: string; teamMode: TeamMode; scoreMode: ScoreMode;
-  mods: string[]; regulations: Regulations; eventChance: number; ranked: boolean; autoRecreateOnInactivity: boolean;
+  mods: string[]; regulations: Regulations; eventChance?: number; ranked: boolean; autoRecreateOnInactivity: boolean;
   locks: { size?: boolean; password?: boolean; mods?: boolean; title?: boolean };
+  totalRounds?: number;
+  minigameWeights?: Record<string, number>;
 }
 export const DEFAULT_CONFIG: LobbyConfig = {
-  title: "AHR lobby", teamMode: 0, scoreMode: 0, mods: [], eventChance: 0.08, ranked: true, autoRecreateOnInactivity: false,
+  title: "osu!Party Lobby", teamMode: 0, scoreMode: 0, mods: [], ranked: true, autoRecreateOnInactivity: false,
+  totalRounds: 10,
+  minigameWeights: {},
   regulations: { enabled: true, allowConvert: false, freeMod: true }, locks: {}
 };
 export interface MapInfo {
   id: number; beatmapsetId: number; title: string; artist: string; version: string; stars: number; length: number; mode: GameMode; converted: boolean; status: string;
   bpm: number; ar: number; hp: number; od: number; cs: number; lastUpdated?: string; rankedDate?: string;
 }
-export interface Participant { id: number; username: string; }
+export interface Participant { id: number; username: string; team?: "Red" | "Blue" | "None" | string; }

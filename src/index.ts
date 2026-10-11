@@ -6,6 +6,7 @@ import { BanchoGateway } from "./adapters/bancho.js";
 import { OsuApi } from "./adapters/osu.js";
 import { LobbyController } from "./lobby-controller.js";
 import { DEFAULT_CONFIG, type LobbyConfig } from "./types.js";
+import { PARTY_MINIGAMES } from "./services/party-minigames.js";
 
 const env = z.object({
   DATABASE_URL: z.string(),
@@ -24,12 +25,20 @@ const bancho = new BanchoGateway(env.BANCHO_USERNAME, env.BANCHO_PASSWORD, env.B
 const controllers = new Map<number, LobbyController>();
 const recreatingLobbies = new Set<number>();
 
+const activeConfig = {
+  totalRounds: DEFAULT_CONFIG.totalRounds ?? 10,
+  minigameWeights: {} as Record<string, number>,
+  ranked: DEFAULT_CONFIG.ranked !== false,
+};
+
 const configSchema = z.object({
   eventChance: z.number().min(0).max(1).optional(),
   ranked: z.boolean().optional(),
   autoRecreateOnInactivity: z.boolean().optional(),
   teamMode: z.number().int().min(0).max(3).optional(),
   scoreMode: z.number().int().min(0).max(3).optional(),
+  totalRounds: z.number().int().min(1).max(100).optional(),
+  minigameWeights: z.record(z.string(), z.number().min(0).max(100)).optional(),
   regulations: z.object({
     enabled: z.boolean().optional(),
     minStar: z.number().min(0).optional(),
@@ -58,6 +67,9 @@ const configSchema = z.object({
 async function createLobby(input: { title: string; password?: string; config?: Partial<LobbyConfig> }) {
   const config: LobbyConfig = {
     ...DEFAULT_CONFIG,
+    totalRounds: activeConfig.totalRounds,
+    minigameWeights: { ...activeConfig.minigameWeights },
+    ranked: activeConfig.ranked,
     ...input.config,
     title: input.title,
     password: input.password,
@@ -71,7 +83,7 @@ async function createLobby(input: { title: string; password?: string; config?: P
   const lobby = await db.lobby.create({
     data: { banchoId, name: input.title, password: input.password, config: config as any },
   });
-  const controller = new LobbyController(db, lobby.id, room, osu, config);
+  const controller = new LobbyController(db, lobby.id, room, osu, config, env.BANCHO_USERNAME);
   controller.onClosed(() => void recreateClosedLobby(lobby.id, controller));
   await controller.start();
   controllers.set(lobby.id, controller);
@@ -105,6 +117,41 @@ async function main() {
   );
 
   app.get("/health", (_req, res) => res.json({ ok: true, lobbies: controllers.size }));
+
+  app.get(["/api/config", "/config"], (_req, res) => {
+    const first = controllers.values().next().value;
+    if (first) {
+      const c = first.getConfig();
+      return res.json({
+        totalRounds: c.totalRounds ?? activeConfig.totalRounds,
+        minigameWeights: c.minigameWeights ?? activeConfig.minigameWeights,
+        ranked: c.ranked ?? activeConfig.ranked,
+      });
+    }
+    return res.json(activeConfig);
+  });
+
+  app.post(["/api/config", "/config"], async (req, res, next) => {
+    try {
+      const body = z.object({
+        totalRounds: z.number().int().min(1).max(100).optional(),
+        minigameWeights: z.record(z.string(), z.number().min(0).max(100)).optional(),
+        ranked: z.boolean().optional(),
+      }).parse(req.body);
+
+      if (body.totalRounds !== undefined) activeConfig.totalRounds = body.totalRounds;
+      if (body.minigameWeights !== undefined) activeConfig.minigameWeights = body.minigameWeights;
+      if (body.ranked !== undefined) activeConfig.ranked = body.ranked;
+
+      for (const controller of controllers.values()) {
+        controller.updateConfig(body);
+      }
+
+      return res.json({ ok: true, config: activeConfig });
+    } catch (e) {
+      next(e);
+    }
+  });
 
   app.post("/players", async (req, res, next) => {
     try {
@@ -165,6 +212,32 @@ async function main() {
         where: { playerId_mode: { playerId: player.id, mode: query.mode } },
       });
 
+      const playerScores = await db.score.findMany({
+        where: { playerId: player.id },
+        include: { match: { select: { minigameId: true } } },
+      });
+      const first = playerScores.filter((s) => s.placement === 1).length;
+      const second = playerScores.filter((s) => s.placement === 2).length;
+      const third = playerScores.filter((s) => s.placement === 3).length;
+
+      const minigameCounts = new Map<string, number>();
+      for (const s of playerScores) {
+        if (s.match.minigameId) {
+          minigameCounts.set(s.match.minigameId, (minigameCounts.get(s.match.minigameId) ?? 0) + 1);
+        }
+      }
+      let mostPlayedId = "";
+      let maxCount = 0;
+      for (const [mgId, count] of minigameCounts) {
+        if (count > maxCount) {
+          maxCount = count;
+          mostPlayedId = mgId;
+        }
+      }
+      const mostPlayedMinigame = mostPlayedId
+        ? (PARTY_MINIGAMES.find((m) => m.id === mostPlayedId)?.name ?? mostPlayedId)
+        : "None";
+
       const eligible = { mode: query.mode, matches: { gte: 3 } };
       const rank =
         stats && stats.matches >= 3
@@ -190,10 +263,13 @@ async function main() {
         username: player.username,
         mode: query.mode,
         points: stats?.points ?? 0,
+        allTimePoints: player.allTimePoints || (stats?.points ?? 0),
         matches: stats?.matches ?? 0,
         wins: stats?.wins ?? 0,
         streak: stats?.streak ?? 0,
-        longestStreak: stats?.longestStreak ?? 0,
+        longestStreak: Math.max(player.longestStreak, stats?.longestStreak ?? 0),
+        podiums: { first, second, third },
+        mostPlayedMinigame,
         rank,
         total,
       });
@@ -236,6 +312,15 @@ async function main() {
         update: values,
       });
 
+      await db.player.update({
+        where: { id: playerId },
+        data: {
+          allTimePoints: pointVal,
+          longestStreak: Math.max(player.longestStreak, body.longestStreak),
+          streak: body.streak,
+        },
+      });
+
       return res.json({ ok: true, stats });
     } catch (e) {
       next(e);
@@ -257,7 +342,7 @@ async function main() {
 
       const players = await db.playerModeStats.findMany({
         where,
-        include: { player: { select: { username: true } } },
+        include: { player: { select: { id: true, username: true, allTimePoints: true, streak: true, longestStreak: true } } },
         orderBy: [{ points: "desc" }, { playerId: "asc" }],
         skip: (currentPage - 1) * perPage,
         take: perPage,
@@ -268,14 +353,21 @@ async function main() {
         page: currentPage,
         total,
         pageCount,
-        players: players.map((entry, index) => ({
-          rank: (currentPage - 1) * perPage + index + 1,
-          username: entry.player.username,
-          points: entry.points,
-          matches: entry.matches,
-          wins: entry.wins,
-          longestStreak: entry.longestStreak,
-        })),
+        players: players.map((entry, index) => {
+          const winRate = entry.matches > 0 ? ((entry.wins / entry.matches) * 100).toFixed(1) : "0.0";
+          return {
+            rank: (currentPage - 1) * perPage + index + 1,
+            id: entry.playerId,
+            username: entry.player.username,
+            points: entry.points,
+            allTimePoints: entry.player.allTimePoints || entry.points,
+            matches: entry.matches,
+            wins: entry.wins,
+            streak: entry.streak,
+            longestStreak: entry.longestStreak,
+            winRate,
+          };
+        }),
       });
     } catch (e) {
       next(e);
@@ -287,7 +379,28 @@ async function main() {
       select: { id: true, banchoId: true, name: true, config: true, createdAt: true },
       orderBy: { createdAt: "desc" },
     });
-    res.json(lobbies.map((lobby) => ({ ...lobby, active: controllers.has(lobby.id) })));
+    const result = await Promise.all(
+      lobbies.map(async (lobby) => {
+        const controller = controllers.get(lobby.id);
+        if (controller) {
+          const standings = await controller.getStandings();
+          return { ...lobby, active: true, standings };
+        }
+        return { ...lobby, active: false };
+      })
+    );
+    res.json(result);
+  });
+
+  app.get("/lobbies/:id/standings", async (req, res, next) => {
+    try {
+      const id = z.coerce.number().int().positive().parse(req.params.id);
+      const controller = controllers.get(id);
+      if (!controller) return res.status(404).json({ error: "This lobby is not active in the current bot session." });
+      return res.json(await controller.getStandings());
+    } catch (e) {
+      next(e);
+    }
   });
 
   app.get("/lobbies/:id/activity", (req, res, next) => {

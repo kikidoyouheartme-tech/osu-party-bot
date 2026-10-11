@@ -117,7 +117,7 @@ export const PARTY_MINIGAMES: MinigameDefinition[] = [
     mapPicker: "host",
     teamMode: 0,
     scoreMode: 0,
-    forcedMods: "NF",
+    forcedMods: "",
     scoringMetric: "misses",
   },
   {
@@ -128,7 +128,7 @@ export const PARTY_MINIGAMES: MinigameDefinition[] = [
     mapPicker: "host",
     teamMode: 0,
     scoreMode: 2,
-    forcedMods: "NF",
+    forcedMods: "",
     scoringMetric: "combo",
   },
   {
@@ -139,7 +139,7 @@ export const PARTY_MINIGAMES: MinigameDefinition[] = [
     mapPicker: "host",
     teamMode: 0,
     scoreMode: 0,
-    forcedMods: "NF",
+    forcedMods: "",
     scoringMetric: "bounty",
   },
 
@@ -148,55 +148,55 @@ export const PARTY_MINIGAMES: MinigameDefinition[] = [
     id: "blindfolded",
     name: "Blindfolded",
     category: "Mod Challenge",
-    description: "Restricted sightlines! Forced Hidden + Flashlight + NoFail.",
+    description: "Restricted sightlines! Forced Hidden + Flashlight.",
     mapPicker: "host",
     teamMode: 0,
     scoreMode: 0,
-    forcedMods: "HD FL NF",
+    forcedMods: "HD FL",
     scoringMetric: "score",
   },
   {
     id: "blind-rhythm",
     name: "Blind Rhythm",
     category: "Mod Challenge",
-    description: "Trust your ear! Vanishing approach circles with forced HD + NF.",
+    description: "Trust your ear! Vanishing approach circles with forced HD.",
     mapPicker: "host",
     teamMode: 0,
     scoreMode: 0,
-    forcedMods: "HD NF",
+    forcedMods: "HD",
     scoringMetric: "score",
   },
   {
     id: "pixel-perfect",
     name: "Pixel Perfect",
     category: "Mod Challenge",
-    description: "Small circles, high OD, and AR10. Forced Hard Rock + NoFail.",
+    description: "Small circles, high OD, and AR10. Forced Hard Rock.",
     mapPicker: "host",
     teamMode: 0,
     scoreMode: 0,
-    forcedMods: "HR NF",
+    forcedMods: "HR",
     scoringMetric: "score",
   },
   {
     id: "lights-out",
     name: "Lights Out",
     category: "Mod Challenge",
-    description: "Highest score inside the flashlight beam under forced Flashlight + NF.",
+    description: "Highest score inside the flashlight beam under forced Flashlight.",
     mapPicker: "host",
     teamMode: 0,
     scoreMode: 0,
-    forcedMods: "FL NF",
+    forcedMods: "FL",
     scoringMetric: "score",
   },
   {
     id: "speedom",
     name: "Speedom",
     category: "Mod Challenge",
-    description: "1.5x speed rush! Forced Double Time + NoFail.",
+    description: "1.5x speed rush! Forced Double Time.",
     mapPicker: "host",
     teamMode: 0,
     scoreMode: 0,
-    forcedMods: "DT NF",
+    forcedMods: "DT",
     scoringMetric: "score",
   },
 
@@ -218,11 +218,11 @@ export const PARTY_MINIGAMES: MinigameDefinition[] = [
     id: "boss-battle",
     name: "Boss Battle",
     category: "Automated Override",
-    description: "Face the host's legacy! Loads the host's #1 top play with their exact mods + NF.",
+    description: "Face the host's legacy! Loads the host's #1 top play with their exact mods.",
     mapPicker: "bot_api_host_top",
     teamMode: 0,
     scoreMode: 0,
-    forcedMods: "NF",
+    forcedMods: "",
     scoringMetric: "score",
     dynamicMods: true,
   },
@@ -234,7 +234,7 @@ export const PARTY_MINIGAMES: MinigameDefinition[] = [
     mapPicker: "bot_api_host_most_played",
     teamMode: 0,
     scoreMode: 0,
-    forcedMods: "NF",
+    forcedMods: "",
     scoringMetric: "score",
   },
   {
@@ -245,7 +245,7 @@ export const PARTY_MINIGAMES: MinigameDefinition[] = [
     mapPicker: "bot_pool_community_choice",
     teamMode: 0,
     scoreMode: 0,
-    forcedMods: "NF",
+    forcedMods: "",
     scoringMetric: "score",
   },
   {
@@ -256,7 +256,7 @@ export const PARTY_MINIGAMES: MinigameDefinition[] = [
     mapPicker: "bot_pool_ranked_rewind",
     teamMode: 0,
     scoreMode: 0,
-    forcedMods: "NF",
+    forcedMods: "",
     scoringMetric: "score",
   },
   {
@@ -267,7 +267,7 @@ export const PARTY_MINIGAMES: MinigameDefinition[] = [
     mapPicker: "bot_pool_loved_classics",
     teamMode: 0,
     scoreMode: 0,
-    forcedMods: "NF",
+    forcedMods: "",
     scoringMetric: "score",
   },
 
@@ -280,7 +280,7 @@ export const PARTY_MINIGAMES: MinigameDefinition[] = [
     mapPicker: "host",
     teamMode: 0,
     scoreMode: 0,
-    forcedMods: "NF",
+    forcedMods: "",
     scoringMetric: "wager",
   },
 
@@ -293,7 +293,7 @@ export const PARTY_MINIGAMES: MinigameDefinition[] = [
     mapPicker: "host",
     teamMode: 2,
     scoreMode: 0,
-    forcedMods: "NF",
+    forcedMods: "",
     scoringMetric: "juggernaut",
   },
 
@@ -315,10 +315,41 @@ export function getMinigame(id: string): MinigameDefinition | undefined {
   return PARTY_MINIGAMES.find((m) => m.id === id);
 }
 
-export function rollNextMinigame(excludeId?: string): MinigameDefinition {
-  const eligible = PARTY_MINIGAMES.filter((g) => g.id !== excludeId);
-  const pool = eligible.length > 0 ? eligible : PARTY_MINIGAMES;
-  return pool[Math.floor(Math.random() * pool.length)];
+export function rollNextMinigame(
+  previousMinigame?: MinigameDefinition | string,
+  weights?: Record<string, number>
+): MinigameDefinition {
+  const prevGame = typeof previousMinigame === "string" ? getMinigame(previousMinigame) : previousMinigame;
+  let eligible = PARTY_MINIGAMES.filter((g) => g.id !== prevGame?.id);
+
+  // If previous round was an automated map picker, force host picker for next round
+  if (prevGame && prevGame.mapPicker !== "host") {
+    eligible = eligible.filter((g) => g.mapPicker === "host");
+  }
+
+  // Filter out disabled games (weight === 0)
+  if (weights) {
+    eligible = eligible.filter((g) => (weights[g.id] ?? 100) > 0);
+  }
+
+  if (eligible.length === 0) {
+    eligible = PARTY_MINIGAMES.filter((g) => g.mapPicker === "host");
+  }
+
+  // Weighted random roll
+  const totalWeight = eligible.reduce((acc, g) => acc + (weights?.[g.id] ?? 100), 0);
+  if (totalWeight <= 0) {
+    return eligible[0] ?? PARTY_MINIGAMES[0];
+  }
+  let randomVal = Math.random() * totalWeight;
+
+  for (const game of eligible) {
+    const weight = weights?.[game.id] ?? 100;
+    if (randomVal < weight) return game;
+    randomVal -= weight;
+  }
+
+  return eligible[0] ?? PARTY_MINIGAMES[0];
 }
 
 export function selectTagMapId(playerCount: number): number {

@@ -3,10 +3,17 @@ import type { RoomActions, RoomActivity } from "./adapters/bancho.js";
 import { OsuApiRequestError, type OsuApi } from "./adapters/osu.js";
 import { DEFAULT_CONFIG, gameModeLabel, type GameMode, type LobbyConfig, type MapInfo, type Participant } from "./types.js";
 import { checkMap } from "./services/regulations.js";
-import { evaluateRoundScores, persistMatchPoints, type RawPlayerScore } from "./services/party-scoring.js";
-import { rollNextMinigame, selectTagMapId, getBanchoSetupCommands, type MinigameDefinition } from "./services/party-minigames.js";
+import { evaluateRoundScores, persistMatchPoints, formatVictoryAnnouncement, type RawPlayerScore } from "./services/party-scoring.js";
+import {
+  rollNextMinigame,
+  selectTagMapId,
+  getBanchoSetupCommands,
+  rollTargetAccuracy,
+  type MinigameDefinition
+} from "./services/party-minigames.js";
 import { balancedTeams } from "./services/teams.js";
 import { VoteBook } from "./services/votes.js";
+import { resolveMinigameMap } from "./services/party-map-pickers.js";
 
 const admins = new Set((process.env.ADMIN_OSU_IDS ?? "").split(",").filter(Boolean).map(Number));
 const fmt = (s: number) => `${Math.floor(s / 60)}m ${s % 60}s`;
@@ -36,6 +43,9 @@ export class LobbyController {
   private matchParticipants: Participant[] = [];
   private teamEvent = false;
   private currentMinigame?: MinigameDefinition;
+  private wasHostMapPick: boolean = true;
+  private currentRound: number = 1;
+  private totalRounds: number = 10;
   private lastValidMapId?: number;
   private lastAnnouncedMapId?: number;
   private passwordSetUntil = 0;
@@ -43,22 +53,33 @@ export class LobbyController {
   private turnWarnings: NodeJS.Timeout[] = [];
   private turnHostId?: number;
   private turnMapId?: number;
+  private targetAccuracy?: number;
+  private leaderPlayerId?: number;
+  private readonly wagers = new Map<number, number>();
   private turnStage?: "select" | "start";
   private intendedHostId?: number;
   private readonly activityLog: LobbyActivity[] = [];
   private readonly closeListeners = new Set<() => void>();
   private closeRequested = false;
+  private readonly botUsername?: string;
+  private automatedBeatmapId?: number;
+  private isPreparingRound = false;
 
   constructor(
     private db: PrismaClient,
     private lobbyId: number,
     private room: RoomActions,
     private osu: OsuApi,
-    config: LobbyConfig = DEFAULT_CONFIG
+    config: LobbyConfig = DEFAULT_CONFIG,
+    botUsername?: string
   ) {
+    this.botUsername = botUsername ?? room.botUsername?.() ?? process.env.BANCHO_USERNAME;
+    this.totalRounds = config.totalRounds ?? 10;
     this.config = {
       ...DEFAULT_CONFIG,
       ...config,
+      totalRounds: this.totalRounds,
+      minigameWeights: config.minigameWeights ?? {},
       ranked: config.ranked !== false,
       regulations: { ...DEFAULT_CONFIG.regulations, ...config.regulations },
       locks: { ...DEFAULT_CONFIG.locks, ...config.locks }
@@ -69,6 +90,25 @@ export class LobbyController {
   onClosed(listener: () => void) { this.closeListeners.add(listener); }
   shouldAutoRecreate() { return this.config.autoRecreateOnInactivity && !this.closeRequested; }
   recreationInput() { return { title: this.config.title, password: this.config.password, config: this.config }; }
+  updateConfig(newConfig: Partial<LobbyConfig>) {
+    if (newConfig.totalRounds !== undefined) {
+      this.totalRounds = newConfig.totalRounds;
+      this.config.totalRounds = newConfig.totalRounds;
+    }
+    if (newConfig.minigameWeights !== undefined) {
+      this.config.minigameWeights = newConfig.minigameWeights;
+    }
+    if (newConfig.ranked !== undefined) {
+      this.config.ranked = newConfig.ranked;
+    }
+    void this.persist();
+  }
+  getConfig(): LobbyConfig {
+    return {
+      ...this.config,
+      totalRounds: this.totalRounds,
+    };
+  }
   private logActivity(level: LobbyActivity["level"], message: string) {
     this.activityLog.push({ at: new Date().toISOString(), level, message });
     if (this.activityLog.length > 200) this.activityLog.shift();
@@ -81,7 +121,7 @@ export class LobbyController {
   async start() {
     this.room.onActivity(activity => this.logActivity(activity.level, activity.message));
     this.room.onMessage((p, t) => this.runActivity(`Chat from ${p.username}`, () => this.handle(p, t)));
-    this.room.onPlayerJoined(player => this.runActivity(`Player joined: ${player.username}`, () => this.joined()));
+    this.room.onPlayerJoined(player => this.runActivity(`Player joined: ${player.username}`, () => this.playerJoined(player)));
     this.room.onPlayerLeft(player => this.runActivity(`Player left: ${player.username}`, () => this.departed(player)));
     this.room.onBeatmapChanged(id => this.runActivity(`Beatmap changed: ${id}`, () => this.validateSelection(id)));
     this.room.onTitleChanged(title => this.runActivity(`Lobby title changed: ${title}`, () => this.enforceTitle(title)));
@@ -102,17 +142,55 @@ export class LobbyController {
 
   private async joined() { await this.syncPlayers(); await this.electHost(); }
 
+  private async playerJoined(player: Participant) {
+    await this.syncPlayers();
+    const existingSession = await this.db.lobbyPlayer.findUnique({
+      where: { lobbyId_playerId: { lobbyId: this.lobbyId, playerId: player.id } }
+    });
+    const isNewParticipant = !existingSession;
+    const sessionPoints = existingSession?.sessionPoints ?? 0;
+
+    await this.db.lobbyPlayer.upsert({
+      where: { lobbyId_playerId: { lobbyId: this.lobbyId, playerId: player.id } },
+      create: { lobbyId: this.lobbyId, playerId: player.id, sessionPoints: 0 },
+      update: { sessionStart: new Date() }
+    });
+
+    const isInitializingHost = (this.currentRound === 1 && this.queue.length <= 1) || this.room.players().length <= 1 || this.room.host()?.id === player.id;
+    if (!isInitializingHost) {
+      if (!isNewParticipant && sessionPoints > 0) {
+        await this.room.say(`[Lobby] Welcome back, ${player.username}! Current game: Round ${this.currentRound}/${this.totalRounds}. Restored ${sessionPoints} session points. You will enter the host queue on the next map.`);
+      } else {
+        await this.room.say(`[Lobby] Welcome, ${player.username}! Current game: Round ${this.currentRound}/${this.totalRounds}. You start with 0 session points and will enter the host queue on the next map.`);
+      }
+    }
+
+    if (this.currentMinigame && this.currentMinigame.forcedMods) {
+      await this.room.command(`!mp mods ${this.currentMinigame.forcedMods}`);
+    } else if (this.currentMinigame && !this.currentMinigame.forcedMods) {
+      await this.room.command("!mp mods freemod");
+    }
+
+    if (this.currentMinigame && this.currentMinigame.teamMode === 2) {
+      const redCount = this.room.players().filter(p => p.team === "Red").length;
+      const blueCount = this.room.players().filter(p => p.team === "Blue").length;
+      const targetTeam = redCount <= blueCount ? "Red" : "Blue";
+      await this.room.command(`!mp team ${player.username} ${targetTeam}`);
+    }
+
+    await this.electHost();
+  }
+
   private async departed(player: Participant) {
     const wasQueued = this.queue.includes(player.id);
     this.queue = this.queue.filter(id => id !== player.id);
     this.autoSkip.delete(player.id);
+    this.wagers.delete(player.id);
     const session = await this.db.lobbyPlayer.findUnique({ where: { lobbyId_playerId: { lobbyId: this.lobbyId, playerId: player.id } } });
     if (session) {
       const elapsedSeconds = Math.max(0, Math.floor((Date.now() - session.sessionStart.getTime()) / 1000));
-      await this.db.$transaction([
-        this.db.player.update({ where: { id: player.id }, data: { playSeconds: { increment: elapsedSeconds } } }),
-        this.db.lobbyPlayer.delete({ where: { lobbyId_playerId: { lobbyId: this.lobbyId, playerId: player.id } } })
-      ]);
+      await this.db.player.update({ where: { id: player.id }, data: { playSeconds: { increment: elapsedSeconds } } });
+      // Retain LobbyPlayer to preserve sessionPoints across disconnect/reconnect within active cycle
     }
     if (wasQueued) await this.room.say(`${player.username} left and was removed from the queue.`);
     setTimeout(() => this.runActivity("Post-leave host reconciliation", async () => { await this.disableSoloAutoSkip(); await this.electHost(); }), 250);
@@ -131,13 +209,19 @@ export class LobbyController {
       }
       const saved = await this.db.player.upsert({ where: { id: p.id }, create: { id: p.id, username }, update: username === existing?.username ? {} : { username } });
       if (!saved.denied && !this.queue.includes(p.id)) this.queue.push(p.id);
-      await this.db.lobbyPlayer.upsert({ where: { lobbyId_playerId: { lobbyId: this.lobbyId, playerId: p.id } }, create: { lobbyId: this.lobbyId, playerId: p.id }, update: {} });
+      await this.db.lobbyPlayer.upsert({ where: { lobbyId_playerId: { lobbyId: this.lobbyId, playerId: p.id } }, create: { lobbyId: this.lobbyId, playerId: p.id, sessionPoints: 0 }, update: {} });
     }
   }
 
   private isHost(p: Participant) { return this.room.host()?.id === p.id; }
 
   private async electHost(attempt = 0) {
+    if (this.currentMinigame && this.currentMinigame.mapPicker !== "host") {
+      if (this.botUsername && this.room.host()?.username !== this.botUsername) {
+        await this.room.command(`!mp host ${this.botUsername}`);
+      }
+      return;
+    }
     const activePlayerIds = new Set(this.room.players().map(player => player.id));
     this.queue = this.queue.filter(id => activePlayerIds.has(id));
     if (this.room.host() || !this.queue[0]) return;
@@ -147,7 +231,6 @@ export class LobbyController {
       await this.room.command(`!mp host #${next}`);
       this.reapplyTitle();
       this.reapplyPassword();
-      await this.room.say(`Host assigned to the first queued player.`);
     } catch (error) {
       this.intendedHostId = undefined;
       if (attempt >= 3) throw error;
@@ -157,6 +240,12 @@ export class LobbyController {
 
   private async hostChanged(host?: Participant) {
     if (this.matchId) return;
+    if (this.currentMinigame && this.currentMinigame.mapPicker !== "host") {
+      if (this.botUsername && host?.username !== this.botUsername) {
+        await this.room.command(`!mp host ${this.botUsername}`);
+      }
+      return;
+    }
     if (!host) {
       this.turnHostId = undefined;
       this.intendedHostId = undefined;
@@ -193,12 +282,16 @@ export class LobbyController {
       }
       this.runActivity("Auto-skip host turn", async () => {
         await this.room.say(`${host.username}'s host turn was automatically skipped.`);
-        await this.skip();
+        await this.passTurnToNextHost();
       });
       return;
     }
-    await this.prepareNextMinigame();
-    this.startTurnTimer("select", host);
+    if (!this.currentMinigame && !this.isPreparingRound) {
+      await this.showQueue();
+      await this.prepareNextMinigame();
+    } else if (this.currentMinigame?.mapPicker === "host") {
+      this.startTurnTimer("select", host);
+    }
   }
 
   private clearTurnTimer() {
@@ -216,28 +309,58 @@ export class LobbyController {
     this.turnMapId = mapId;
     this.turnStage = stage;
     const action = stage === "select" ? "select a map" : "start the match";
-    if (stage === "select") {
-      this.runActivity("Select-map timer started", () =>
-        this.room.say(`${host.username}, you have 5 minutes to select a map or host will be passed to the next player.`)
-      );
-    }
-    for (const [delay, remaining] of [[180_000, "2 minutes"], [240_000, "1 minute"], [270_000, "30 seconds"], [290_000, "10 seconds"]] as const) {
+    for (const [delay, remaining] of [[60_000, "2 minutes"], [120_000, "1 minute"], [150_000, "30 seconds"], [170_000, "10 seconds"]] as const) {
       this.turnWarnings.push(
         setTimeout(() => this.runActivity(`Turn warning: ${remaining}`, () => this.room.say(`${host.username}: ${remaining} left to ${action}.`)), delay)
       );
     }
-    this.turnTimer = setTimeout(() => this.runActivity("Turn timer expired", () => this.turnExpired(stage, host, mapId)), 300_000);
+    this.turnTimer = setTimeout(() => this.runActivity("Turn timer expired", () => this.turnExpired(stage, host, mapId)), 180_000);
+  }
+
+  private async passTurnToNextHost() {
+    this.clearTurnTimer();
+    this.turnHostId = undefined;
+    this.turnMapId = undefined;
+    this.turnStage = undefined;
+
+    if (this.queue.length) {
+      this.queue.push(this.queue.shift()!);
+    }
+    this.reapplyTitle();
+    this.reapplyPassword();
+
+    await this.showQueue();
+
+    const nextHostId = this.queue[0];
+    const players = this.room.players();
+    const nextHost = (nextHostId ? players.find(p => p.id === nextHostId) : undefined) ?? this.room.host();
+    const nextHostUsername = nextHost?.username ?? "Host";
+
+    if (nextHostId) {
+      this.intendedHostId = nextHostId;
+      await this.room.command(`!mp host #${nextHostId}`);
+    }
+
+    await this.room.say(`[Host] ${nextHostUsername}, select a map! (3 min limit)`);
+    if (nextHost) {
+      this.startTurnTimer("select", nextHost);
+    }
   }
 
   private async turnExpired(stage: "select" | "start", host: Participant, mapId?: number) {
     if (this.room.host()?.id !== host.id || this.matchId) return;
     this.clearTurnTimer();
+    if (this.room.players().length <= 1) {
+      await this.room.say(`${host.username}: 3 minutes elapsed. Select a map and start when ready.`);
+      this.startTurnTimer(stage, host, mapId);
+      return;
+    }
     if (stage === "select") {
       await this.room.say(`${host.username} ran out of time to select a map. Host passed.`);
-      await this.skip();
+      await this.passTurnToNextHost();
     } else {
-      await this.room.say(`${host.username} ran out of time to start. Starting automatically.`);
-      await this.startMatch(0);
+      await this.room.say(`${host.username} ran out of time to start. Host passed.`);
+      await this.passTurnToNextHost();
     }
   }
 
@@ -263,33 +386,38 @@ export class LobbyController {
     const value = args.join(" ");
     if (cmd.startsWith("*") && !admins.has(p.id)) return void this.room.say(`${p.username}: administrator permission required.`);
     if (cmd === "!queue") return void this.showQueue();
-    if (cmd === "!cmds") return void this.room.say("Command list: https://ronaldonater.com/osu-ahr");
+    if (["!cmds", "!commands", "!help"].includes(cmd)) return void this.room.say("[Commands] !cmds | !minigame | !round | !points | !pstats | !leaderboard | !bet <amount>");
+    if (["!minigame", "!game", "!rules"].includes(cmd)) return void this.showMinigameInfo();
+    if (["!round", "!cycle"].includes(cmd)) return void this.showRoundInfo();
+    if (["!points", "!pts"].includes(cmd)) return void this.showPoints(p);
+    if (["!leaderboard", "!standings"].includes(cmd)) return void this.showStandings();
     if (cmd === "!bug") return void this.room.say("Report a bug: https://github.com/ronaldonater/osu-ahr-bot/issues");
     if (cmd === "!donate") return void this.room.say("Support the bot: https://ko-fi.com/ronaldonater");
     if (["!regulations"].includes(cmd)) return void this.showRegulations();
     if (["!version", "!v"].includes(cmd)) return void this.room.say("osu-ahr-bot v0.1.22");
     if (["!playtime", "!pt"].includes(cmd)) return void this.playtime(p, value || undefined);
     if (["!timeleft", "!tl"].includes(cmd)) return void this.timeleft();
-    if (["!ostats", "!os"].includes(cmd)) { const { username, mode } = this.usernameAndMode(args); return void this.stats(p, username, mode); }
+    if (["!pstats", "!stats", "!ostats", "!os"].includes(cmd)) { const { username, mode } = this.usernameAndMode(args); return void this.stats(p, username, mode); }
     if (["!top", "!t"].includes(cmd)) return void this.top(args);
-    if (["!how", "!h"].includes(cmd)) return void this.room.say("Ranked Party matches award points using the (N - rank) formula. Highest score earns the most points. Random events are unranked.");
+    if (["!how", "!h"].includes(cmd)) return void this.room.say("Ranked Party matches award PartyPoints using the (N - rank) formula. Highest score earns the most points. Unranked matches award no PartyPoints.");
     if (cmd === "!rank") { const { username, mode } = this.usernameAndMode(args); return void this.rank(p, username, mode); }
     if (["!lastscore", "!ls"].includes(cmd)) return void this.lastScore();
     if (["!bestscore", "!bs"].includes(cmd)) return void this.bestScore(p, value || undefined);
+    if (["!bet", "!wager"].includes(cmd)) return void this.bet(p, args[0]);
     if (cmd === "!autoskip") return void this.setAutoSkip(p, args[0]);
     if (cmd === "!update") return void (this.isHost(p) ? this.updateMap() : this.room.say(`${p.username}: only the current host can use !update.`));
     if (cmd === "!votekick") return void this.voteKick(p, value);
-    if (cmd === "!skip") return void (this.isHost(p) ? this.skip() : this.vote("skip", p));
+    const force = (args[0] === "force" && admins.has(p.id)) || cmd === "*skip";
+    if (cmd === "!skip") return void (this.isHost(p) || admins.has(p.id) ? this.skip(force, true) : this.vote("skip", p));
     if (cmd === "!start") return void (this.isHost(p) ? this.startMatch(Number(args[0] ?? 5)) : this.vote("start", p));
-    if (cmd === "!abort") return void this.vote("abort", p);
+    if (cmd === "!abort") return void (this.isHost(p) ? this.abortMatch() : this.vote("abort", p));
     if (cmd === "!stop" && this.isHost(p)) return void this.stopTimer();
     if (cmd === "*start") return void this.startMatch(0);
-    if (cmd === "*skip") return void this.skip();
+    if (cmd === "*skip") return void this.skip(true, true);
     if (cmd === "*abort") return void this.abortMatch();
     if (cmd === "*order") return void this.order(value);
     if (cmd === "*resetelo" || cmd === "*resetpoints") return void this.resetPoints(args[0]);
     if (cmd === "*close") return void this.close();
-    if (cmd === "*eventchance") return void this.setEventChance(args[0]);
     if (cmd === "*ranked") return void this.setRanked(args[0]);
     if (cmd === "*kick") return void this.kick(value);
     if (cmd === "*keep") return void this.keep(args);
@@ -303,7 +431,7 @@ export class LobbyController {
     await this.room.say(`${kind}: ${r.count}/${r.required}`);
     if (r.passed) {
       this.votes.clear();
-      if (kind === "skip") await this.skip();
+      if (kind === "skip") await this.skip(false, true);
       if (kind === "start") await this.startMatch(5);
       if (kind === "abort") await this.abortMatch();
     }
@@ -323,7 +451,26 @@ export class LobbyController {
     await this.room.say(`${target.username} was removed by a player vote.`);
   }
 
-  private async abortMatch() { await this.room.command("!mp abort"); await this.room.say("Match aborted."); }
+  private async abortMatch() {
+    this.stopTimer();
+    this.clearTurnTimer();
+    this.wagers.clear();
+    this.matchId = undefined;
+    this.activeBeatmapId = undefined;
+    this.automatedBeatmapId = undefined;
+    this.matchGameMode = undefined;
+    this.startedAt = undefined;
+    this.matchParticipants = [];
+    this.votes.clear();
+    await this.room.command("!mp abort");
+    await this.room.say(
+      `[Match] Match aborted. Scores discarded. Round ${this.currentRound}/${this.totalRounds} can be restarted, or use !skip to roll a new minigame.`
+    );
+    const host = this.room.host();
+    if (host) {
+      this.startTurnTimer(this.room.beatmapId() ? "start" : "select", host, this.room.beatmapId());
+    }
+  }
 
   private async showQueue() {
     const rows = await this.db.player.findMany({ where: { id: { in: this.queue } } });
@@ -337,7 +484,7 @@ export class LobbyController {
       if (this.room.players().length <= 1) return void this.room.say(`${p.username}: auto-skip cannot be enabled in a one-player lobby.`);
       this.autoSkip.add(p.id);
       await this.room.say(`${p.username}: auto-skip enabled. Your host turns will be passed automatically.`);
-      if (this.isHost(p) && !this.matchId) await this.skip();
+      if (this.isHost(p) && !this.matchId) await this.passTurnToNextHost();
     } else {
       this.autoSkip.delete(p.id);
       await this.room.say(`${p.username}: auto-skip disabled.`);
@@ -365,26 +512,49 @@ export class LobbyController {
     return `Map regulations — Stars: ${stars} | Length: ${length} | BPM: ${range(r.minBpm, r.maxBpm)} | AR: ${range(r.minAr, r.maxAr)} | HP: ${range(r.minHp, r.maxHp)} | OD: ${range(r.minOd, r.maxOd)} | CS: ${range(r.minCs, r.maxCs)} | Year: ${range(r.minLastUpdatedYear, r.maxLastUpdatedYear)} | Mode: ${mode} | Status: ${statuses} | Converts: ${r.allowConvert ? "allowed" : "not allowed"} | Free mod: ${r.freeMod ? "enabled" : "disabled"}.`;
   }
 
-  private async skip() {
-    if (this.queue.length) this.queue.push(this.queue.shift()!);
-    const next = this.queue[0];
-    this.turnHostId = undefined;
-    if (next) {
-      this.intendedHostId = next;
-      await this.room.command(`!mp host #${next}`);
+  private async advanceToNextRound(force = false) {
+    this.targetAccuracy = undefined;
+    this.clearTurnTimer();
+    this.stopTimer();
+
+    if (!force && !this.wasHostMapPick) {
+      const currentHost = this.queue[0] ? this.room.players().find(p => p.id === this.queue[0]) : undefined;
+      const hostName = currentHost?.username ?? "Host";
+      await this.room.say(`[Host] Map was bot-selected; ${hostName} retains host for next round.`);
+      this.wasHostMapPick = true;
+      this.turnHostId = undefined;
+    } else {
+      this.wasHostMapPick = true;
+      if (this.queue.length) this.queue.push(this.queue.shift()!);
+      this.turnHostId = undefined;
     }
+
     this.reapplyTitle();
     this.reapplyPassword();
-    setTimeout(() => this.runActivity("Host-rotation confirmation", () => this.hostChanged(this.room.host())), 500);
+
+    // Step 2: Queue Status
     await this.showQueue();
+
+    // Step 3 & 4: Prepare next minigame and dispatch announcements
+    await this.prepareNextMinigame();
+  }
+
+  private async skip(force = false, isUserSkip = true) {
+    if (isUserSkip) {
+      await this.room.say("[Skip] Round skipped. Rolling next minigame...");
+    }
+    this.wagers.clear();
+    await this.advanceToNextRound(force);
   }
 
   private async startMatch(seconds: number) {
     if (!Number.isFinite(seconds) || seconds < 0 || seconds > 120) return void this.room.say("Start delay must be between 0 and 120 seconds.");
     const mapId = this.room.beatmapId();
     if (!mapId) return void this.room.say("Select a beatmap first.");
-    const reason = checkMap(await this.osu.beatmap(mapId), this.config.regulations);
-    if (reason) return void this.room.say(`Map rejected: ${reason}.`);
+    if (this.currentMinigame?.mapPicker === "host") {
+      const reason = checkMap(await this.osu.beatmap(mapId), this.config.regulations);
+      if (reason) return void this.room.say(`Map rejected: ${reason}.`);
+    }
     this.clearTurnTimer();
     this.stopTimer();
     this.timer = setTimeout(() => this.runActivity("Match launch", () => this.launch(mapId)), seconds * 1000);
@@ -393,6 +563,15 @@ export class LobbyController {
 
   private async validateSelection(mapId: number) {
     if (!Number.isInteger(mapId) || mapId <= 0) return;
+    if (this.currentMinigame && this.currentMinigame.mapPicker !== "host") {
+      if (this.automatedBeatmapId && mapId !== this.automatedBeatmapId) {
+        await this.room.command(`!mp map ${this.automatedBeatmapId}`);
+        await this.room.say("[Lock] Beatmap is locked for this minigame.");
+      } else {
+        this.lastValidMapId = mapId;
+      }
+      return;
+    }
     try {
       const map = await this.osu.beatmap(mapId);
       const reason = checkMap(map, this.config.regulations);
@@ -446,63 +625,129 @@ export class LobbyController {
   private async setLobbyMode(teamMode: number, scoreMode: number) { await this.room.command(`!mp set ${teamMode} ${scoreMode}`); }
 
   private async prepareNextMinigame() {
-    // 1. Roll the next minigame
-    this.currentMinigame = rollNextMinigame(this.currentMinigame?.id);
-    this.teamEvent = this.currentMinigame.teamMode === 2 || this.currentMinigame.teamMode === 3;
+    if (this.isPreparingRound) return;
+    this.isPreparingRound = true;
+    try {
+      // 1. Roll the next minigame
+      this.currentMinigame = rollNextMinigame(this.currentMinigame, this.config.minigameWeights);
+      this.wasHostMapPick = this.currentMinigame.mapPicker === "host";
+      this.teamEvent = this.currentMinigame.teamMode === 2 || this.currentMinigame.teamMode === 3;
+      this.wagers.clear();
 
-    // 2. Announce to Bancho Chat
-    await this.room.say(`🎲 Next Minigame: ${this.currentMinigame.name}`);
-    await this.room.say(`📜 ${this.currentMinigame.description}`);
-
-    // 3. Apply Bancho Rules (Mode & Mods)
-    const commands = getBanchoSetupCommands(this.currentMinigame);
-    for (const cmd of commands) {
-      await this.room.command(cmd);
-    }
-
-    const players = this.room.players();
-
-    // 4. Handle Team Balancing (Clash & Juggernaut)
-    if (this.currentMinigame.teamMode === 2) {
-      const activeIds = players.map(p => p.id);
-      const dbPlayers = await this.db.player.findMany({ where: { id: { in: activeIds } } });
-      const modeStats = await this.db.playerModeStats.findMany({ where: { playerId: { in: activeIds }, mode: this.currentStatsMode() } });
-      const pointsByPlayer = new Map(modeStats.map(stat => [stat.playerId, stat.points]));
-      const hydratedPlayers = dbPlayers.map(p => ({ ...p, elo: pointsByPlayer.get(p.id) ?? 0 }));
-
-      if (this.currentMinigame.scoringMetric === "juggernaut") {
-        hydratedPlayers.sort((a, b) => b.elo - a.elo);
-        const juggernaut = hydratedPlayers[0];
-        if (juggernaut) {
-          await this.room.command(`!mp team ${juggernaut.username} Red`);
-          for (let i = 1; i < hydratedPlayers.length; i++) {
-            await this.room.command(`!mp team ${hydratedPlayers[i].username} Blue`);
-          }
-        }
+      // 2. Set targets
+      if (this.currentMinigame.id === "target-practice") {
+        this.targetAccuracy = rollTargetAccuracy();
       } else {
-        const teams = balancedTeams(hydratedPlayers);
-        for (const player of teams.red) await this.room.command(`!mp team ${player.username} Red`);
-        for (const player of teams.blue) await this.room.command(`!mp team ${player.username} Blue`);
+        this.targetAccuracy = undefined;
       }
-    }
 
-    // 5. Handle Map Selection
-    if (this.currentMinigame.mapPicker === "host") {
-      await this.room.say(`👉 Host, please select a map!`);
-    } else if (this.currentMinigame.mapPicker === "bot_tag") {
-      const mapId = selectTagMapId(players.length);
-      await this.room.command(`!mp map ${mapId}`);
-      await this.room.say(`Automated Pick: Tag map selected for ${players.length} players.`);
-    } else if (this.currentMinigame.mapPicker.startsWith("bot_")) {
-      await this.room.say(`[Automated API/Pool Map Picker pending implementation...]`);
+      // 3. Apply Bancho Rules (Mode & Mods)
+      const commands = getBanchoSetupCommands(this.currentMinigame);
+      for (const cmd of commands) {
+        await this.room.command(cmd);
+      }
+
+      const players = this.room.players();
+
+      if (this.currentMinigame.scoringMetric === "bounty" || this.currentMinigame.scoringMetric === "juggernaut") {
+        const activeIds = players.map(p => p.id);
+        const modeStats = await this.db.playerModeStats.findMany({
+          where: { playerId: { in: activeIds }, mode: this.currentStatsMode() },
+          orderBy: { points: "desc" }
+        });
+        this.leaderPlayerId = modeStats[0]?.playerId;
+      } else {
+        this.leaderPlayerId = undefined;
+      }
+
+      // 4. Handle Team Balancing (Clash & Juggernaut)
+      if (this.currentMinigame.teamMode === 2) {
+        const activeIds = players.map(p => p.id);
+        const dbPlayers = await this.db.player.findMany({ where: { id: { in: activeIds } } });
+        const modeStats = await this.db.playerModeStats.findMany({ where: { playerId: { in: activeIds }, mode: this.currentStatsMode() } });
+        const pointsByPlayer = new Map(modeStats.map(stat => [stat.playerId, stat.points]));
+        const hydratedPlayers = dbPlayers.map(p => ({ ...p, points: pointsByPlayer.get(p.id) ?? 0, elo: pointsByPlayer.get(p.id) ?? 0 }));
+
+        if (this.currentMinigame.scoringMetric === "juggernaut") {
+          hydratedPlayers.sort((a, b) => (b.points ?? b.elo) - (a.points ?? a.elo));
+          const juggernaut = hydratedPlayers[0];
+          if (juggernaut) {
+            await this.room.command(`!mp team ${juggernaut.username} Red`);
+            for (let i = 1; i < hydratedPlayers.length; i++) {
+              await this.room.command(`!mp team ${hydratedPlayers[i].username} Blue`);
+            }
+          }
+        } else {
+          const teams = balancedTeams(hydratedPlayers);
+          for (const player of teams.red) await this.room.command(`!mp team ${player.username} Red`);
+          for (const player of teams.blue) await this.room.command(`!mp team ${player.username} Blue`);
+        }
+      }
+
+      // 5. Host & Map Configuration commands (dispatched before announcements)
+      let actionLine = "";
+      let hostToTimer: Participant | undefined;
+
+      if (this.currentMinigame.mapPicker === "host") {
+        this.automatedBeatmapId = undefined;
+        const hostId = this.queue[0];
+        if (hostId) {
+          this.intendedHostId = hostId;
+          await this.room.command(`!mp host #${hostId}`);
+        }
+        const hostPlayer = (hostId ? players.find(p => p.id === hostId) : undefined) ?? this.room.host();
+        const hostUsername = hostPlayer?.username ?? "Host";
+        actionLine = `[Host] ${hostUsername}, select a map! (3 min limit)`;
+        hostToTimer = hostPlayer;
+      } else {
+        if (this.botUsername) {
+          await this.room.command(`!mp host ${this.botUsername}`);
+        }
+        this.clearTurnTimer();
+        const host = (this.queue[0] ? players.find(p => p.id === this.queue[0]) : undefined) ?? this.room.host();
+        const picked = await resolveMinigameMap(this.currentMinigame.mapPicker, {
+          hostId: host?.id,
+          hostUsername: host?.username,
+          playerCount: players.length,
+          osu: this.osu,
+        });
+
+        if (picked) {
+          this.automatedBeatmapId = picked.beatmapId;
+          if (picked.overrideMods) {
+            await this.room.command(`!mp mods ${picked.overrideMods}`);
+          }
+          await this.room.command(`!mp map ${picked.beatmapId}`);
+          actionLine = `[Pick] ${picked.announcement}`;
+        } else {
+          const hostUsername = host?.username ?? "Host";
+          actionLine = `[Host] Automated pick could not be loaded. ${hostUsername}, select a map! (3 min limit)`;
+          hostToTimer = host;
+        }
+      }
+
+      // Step 3: Minigame Round Announcement
+      let line1 = `[Round ${this.currentRound}/${this.totalRounds}] ${this.currentMinigame.name} | ${this.currentMinigame.description}`;
+      if (this.currentMinigame.id === "target-practice" && this.targetAccuracy !== undefined) {
+        line1 += ` | Target: ${this.targetAccuracy}%`;
+      }
+      await this.room.say(line1);
+
+      // Step 4: Host Prompt / Map Action (MUST BE THE LATEST MESSAGE)
+      await this.room.say(actionLine);
+      if (hostToTimer) {
+        this.startTurnTimer("select", hostToTimer);
+      }
+    } finally {
+      this.isPreparingRound = false;
     }
   }
 
-  private async launch(mapId: number) {
-    const gameMode = (await this.osu.beatmap(mapId)).mode;
-    await this.beginMatch(mapId, gameMode);
-    await this.room.command("!mp start");
-  }
+private async launch(mapId: number) {
+  const gameMode = (await this.osu.beatmap(mapId)).mode;
+  await this.beginMatch(mapId, gameMode);
+  await this.room.command("!mp start");
+}
 
   private async beginMatch(mapId = this.room.beatmapId(), gameMode?: GameMode) {
     if (this.matchId) return;
@@ -530,7 +775,7 @@ export class LobbyController {
     await this.room.say(`Selected map: ${name} | ${map.stars.toFixed(2)}★ | ${fmt(map.length)} | [${mirrorLink} Beatconnect Mirror]`);
   }
 
-  private async finish(scores: Array<{ player: Participant; score: number; team?: "red" | "blue" }>) {
+  private async finish(scores: Array<{ player: Participant; score: number; team?: "red" | "blue"; pass?: boolean; misses?: number; accuracy?: number; combo?: number }>) {
     if (!this.matchId) return;
     const ordered = [...scores].sort((a, b) => b.score - a.score);
     const gameMode = this.matchGameMode ?? this.selectedGameMode ?? this.config.regulations.gameMode ?? "osu";
@@ -542,43 +787,233 @@ export class LobbyController {
     const rawScores: RawPlayerScore[] = participants.map(player => {
       const result = resultByPlayer.get(player.id);
       const score = result?.score;
+      const misses = typeof result?.misses === "number" && !isNaN(result.misses)
+        ? Math.max(0, Math.floor(result.misses))
+        : 0;
+      const accuracy = typeof result?.accuracy === "number" && !isNaN(result.accuracy)
+        ? result.accuracy
+        : 100.0;
+      const combo = typeof result?.combo === "number" && !isNaN(result.combo)
+        ? Math.max(0, Math.floor(result.combo))
+        : 0;
       return {
         playerId: player.id,
         username: player.username,
-        score: score === undefined || score === null || score === -1 ? 0 : score
+        score: score === undefined || score === null || score === -1 ? 0 : score,
+        accuracy,
+        combo,
+        misses,
+        passed: result?.pass ?? true,
+        team: result?.team === "red" ? "Red" : result?.team === "blue" ? "Blue" : "None",
+        wagerAmount: this.wagers.get(player.id) ?? 0,
       };
     });
 
     const ranked = this.config.ranked && rawScores.length > 1;
     if (ranked) {
-      const evaluated = evaluateRoundScores(rawScores);
+      const evaluated = evaluateRoundScores(rawScores, {
+        minigame: this.currentMinigame,
+        targetAccuracy: this.targetAccuracy,
+        leaderPlayerId: this.leaderPlayerId,
+      });
       await persistMatchPoints(this.db, {
         lobbyId: this.lobbyId,
         beatmapId: this.activeBeatmapId,
         minigameId: this.currentMinigame?.id ?? "unknown",
         gameMode,
-        results: evaluated
+        results: evaluated,
+        rawScores,
       });
 
-      const summary = evaluated.map(r => `#${r.placement} ${r.username} (+${r.pointsEarned} pts)`).join(" | ");
-      await this.room.say(`🏆 Results: ${summary}`);
+      const winnerRaw = rawScores.find(s => s.playerId === evaluated[0].playerId);
+      const victoryLine = formatVictoryAnnouncement({
+        metric: this.currentMinigame?.scoringMetric ?? "score",
+        winner: evaluated[0],
+        winnerRaw,
+        targetAccuracy: this.targetAccuracy,
+        leaderPlayerId: this.leaderPlayerId,
+        leaderUsername: rawScores.find(s => s.playerId === this.leaderPlayerId)?.username,
+        winningTeam: winnerRaw?.team,
+      });
+      await this.room.say(victoryLine);
+
+      const summary = evaluated.map(r => `#${r.placement} ${r.username} (+${r.pointsEarned} PartyPoints)`).join(" | ");
+      await this.room.say(`[Results] ${summary}`);
     } else if (!this.config.ranked) {
-      await this.room.say("This lobby is unranked; no points or competitive stats were applied.");
+      await this.room.say("[Results] This lobby is unranked; no points or competitive stats were applied.");
     } else if (rawScores.length <= 1) {
-      await this.room.say("No points were applied: at least two players are required for a ranked match.");
+      await this.room.say("[Results] No points were applied: at least two players are required for a ranked match.");
     }
+
+    if (this.currentRound >= this.totalRounds) {
+      await this.announcePodium();
+      await this.resetPartySession();
+      this.currentRound = 1;
+    } else {
+      this.currentRound++;
+    }
+
+    this.wagers.clear();
+    this.leaderPlayerId = undefined;
 
     const mapId = this.activeBeatmapId;
     const startedAt = this.startedAt;
     const leaderboardParticipants = ordered.map(x => ({ ...x.player, matchScore: x.score }));
     this.matchId = undefined;
     this.activeBeatmapId = undefined;
+    this.automatedBeatmapId = undefined;
     this.matchGameMode = undefined;
     this.startedAt = undefined;
     this.matchParticipants = [];
     if (mapId && startedAt) setTimeout(() => this.runActivity("Leaderboard-score check", () => this.announceLeaderboardScores(mapId, startedAt, leaderboardParticipants)), 10_000);
     
-    await this.skip();
+    await this.advanceToNextRound(false);
+  }
+
+  private getOrdinal(n: number): string {
+    const s = ["th", "st", "nd", "rd"];
+    const v = n % 100;
+    return n + (s[(v - 20) % 10] || s[v] || s[0]);
+  }
+
+  private async announcePodium() {
+    const lobbyPlayers = await this.db.lobbyPlayer.findMany({
+      where: { lobbyId: this.lobbyId },
+      include: { player: true },
+      orderBy: { sessionPoints: "desc" },
+    });
+
+    await this.room.say("=========================================");
+    await this.room.say("[PARTY OVER] Grand Prix Final Standings:");
+    const podium = lobbyPlayers.slice(0, 3);
+    for (let i = 0; i < podium.length; i++) {
+      const entry = podium[i];
+      await this.room.say(`${this.getOrdinal(i + 1)} Place: ${entry.player.username} - ${entry.sessionPoints} pts`);
+    }
+    await this.room.say("=========================================");
+  }
+
+  private async resetPartySession() {
+    await this.db.lobbyPlayer.updateMany({
+      where: { lobbyId: this.lobbyId },
+      data: { sessionPoints: 0 },
+    });
+  }
+
+  private async bet(p: Participant, amountStr?: string) {
+    if (this.currentMinigame?.scoringMetric !== "wager") {
+      return void this.room.say(`[Wager] ${p.username}: bets are only allowed during the PartyPoint Wager minigame.`);
+    }
+    if (this.matchId) {
+      return void this.room.say(`[Wager] ${p.username}: bets cannot be placed once the match has started.`);
+    }
+    const amount = Number(amountStr);
+    if (!Number.isInteger(amount) || amount <= 0) {
+      return void this.room.say("[Wager] Usage: !bet <positive integer amount> (e.g. !bet 5).");
+    }
+    const player = await this.db.player.findUnique({ where: { id: p.id } });
+    const currentPoints = player?.allTimePoints ?? 0;
+    if (amount > currentPoints) {
+      return void this.room.say(`[Wager] ${p.username}: you only have ${currentPoints} PartyPoints to wager.`);
+    }
+    this.wagers.set(p.id, amount);
+    await this.room.say(`[Wager] ${p.username} wagered ${amount} PartyPoints! Finish in the top placements to double it!`);
+  }
+
+  private async showMinigameInfo() {
+    if (!this.currentMinigame) {
+      return void this.room.say("[Minigame] No active minigame.");
+    }
+    let text = `[Minigame] Round ${this.currentRound}/${this.totalRounds}: ${this.currentMinigame.name} | Rules: ${this.currentMinigame.description}`;
+    if (this.currentMinigame.id === "target-practice" && this.targetAccuracy !== undefined) {
+      text += ` | Target: ${this.targetAccuracy}%`;
+    }
+    await this.room.say(text);
+  }
+
+  private async showRoundInfo() {
+    const hostName = this.room.host()?.username ?? "None";
+    await this.room.say(`[Round] Current: ${this.currentRound}/${this.totalRounds} | Host: ${hostName}`);
+  }
+
+  private async showPoints(p: Participant) {
+    const player = await this.db.player.findUnique({ where: { id: p.id } });
+    const session = await this.db.lobbyPlayer.findUnique({
+      where: { lobbyId_playerId: { lobbyId: this.lobbyId, playerId: p.id } },
+    });
+    const sessionPts = session?.sessionPoints ?? 0;
+    const allTimePts = player?.allTimePoints ?? 0;
+    await this.room.say(`[PartyPoints] ${p.username}: ${sessionPts} PartyPoints (Session) | ${allTimePts} PartyPoints (All-Time)`);
+  }
+
+  private async showStandings() {
+    const currentPlayers = this.room.players();
+    const playerIds = currentPlayers.map((p) => p.id);
+    const lobbyPlayers = await this.db.lobbyPlayer.findMany({
+      where: { lobbyId: this.lobbyId, playerId: { in: playerIds } },
+      include: { player: true },
+      orderBy: { sessionPoints: "desc" },
+      take: 5,
+    });
+    if (!lobbyPlayers.length) {
+      return void this.room.say("[Standings] No players in standings yet.");
+    }
+    const formatted = lobbyPlayers
+      .map((entry, index) => `${index + 1}. ${entry.player.username} (${entry.sessionPoints} pts)`)
+      .join(" | ");
+    await this.room.say(`[Standings] ${formatted}`);
+  }
+
+  public async getStandings(): Promise<{
+    currentRound: number;
+    totalRounds: number;
+    minigameName?: string;
+    players: Array<{
+      position: number;
+      id: number;
+      username: string;
+      sessionPoints: number;
+      allTimePoints: number;
+      streak: number;
+      status: string;
+    }>;
+  }> {
+    const currentPlayers = this.room.players();
+    const host = this.room.host();
+    const playerIds = currentPlayers.map((p) => p.id);
+
+    const lobbyPlayers = playerIds.length > 0 ? await this.db.lobbyPlayer.findMany({
+      where: { lobbyId: this.lobbyId, playerId: { in: playerIds } },
+      include: { player: true },
+      orderBy: { sessionPoints: "desc" },
+    }) : [];
+
+    const existingMap = new Map(lobbyPlayers.map((lp) => [lp.playerId, lp]));
+
+    const entries = currentPlayers.map((p) => {
+      const lp = existingMap.get(p.id);
+      const isHost = host?.id === p.id;
+      return {
+        id: p.id,
+        username: p.username,
+        sessionPoints: lp?.sessionPoints ?? 0,
+        allTimePoints: lp?.player?.allTimePoints ?? 0,
+        streak: lp?.player?.streak ?? 0,
+        status: isHost ? "Host" : "Ready",
+      };
+    });
+
+    entries.sort((a, b) => b.sessionPoints - a.sessionPoints || b.allTimePoints - a.allTimePoints);
+
+    return {
+      currentRound: this.currentRound,
+      totalRounds: this.totalRounds,
+      minigameName: this.currentMinigame?.name,
+      players: entries.map((e, idx) => ({
+        position: idx + 1,
+        ...e,
+      })),
+    };
   }
 
   private async announceLeaderboardScores(mapId: number, startedAt: Date, players: Array<Participant & { matchScore: number }>) {
@@ -647,7 +1082,7 @@ export class LobbyController {
     const mode = requestedMode ?? this.currentStatsMode();
     const stats = await this.db.playerModeStats.findUnique({ where: { playerId_mode: { playerId: player.id, mode } } });
     if (!stats) return void this.room.say(`${player.username}: no ${gameModeLabel(mode)} local stats found yet.`);
-    await this.room.say(`${player.username} (${gameModeLabel(mode)}): ${stats.points} pts, LWS ${stats.longestStreak}, matches ${stats.matches}, win rate ${winRate(stats)}%.`);
+    await this.room.say(`${player.username} (${gameModeLabel(mode)}): ${stats.points} PartyPoints, LWS ${stats.longestStreak}, matches ${stats.matches}, win rate ${winRate(stats)}%.`);
   }
 
   private async top(args: string[]) {
@@ -745,14 +1180,6 @@ export class LobbyController {
     await this.room.command("!mp close");
   }
 
-  private async setEventChance(value?: string) {
-    const percent = Number(value);
-    if (!Number.isFinite(percent) || percent < 0 || percent > 100) return void this.room.say("Usage: *eventchance [0-100].");
-    this.config.eventChance = percent / 100;
-    await this.persist();
-    await this.room.say(`Random event chance set to ${percent}%.`);
-  }
-
   private async setRanked(value?: string) {
     const enabled = value?.toLowerCase();
     if (enabled !== "on" && enabled !== "off") return void this.room.say("Usage: *ranked [on/off].");
@@ -768,9 +1195,8 @@ export class LobbyController {
     if (matches === 0) await this.db.lobby.delete({ where: { id: this.lobbyId } }).catch(() => undefined);
   }
 
-  async updateRegulations(regulations: Partial<LobbyConfig["regulations"]>, eventChance?: number, details?: { title?: string; password?: string; removePassword?: boolean; ranked?: boolean; autoRecreateOnInactivity?: boolean }) {
+  async updateRegulations(regulations: Partial<LobbyConfig["regulations"]>, _eventChance?: number, details?: { title?: string; password?: string; removePassword?: boolean; ranked?: boolean; autoRecreateOnInactivity?: boolean }) {
     this.config.regulations = { ...DEFAULT_CONFIG.regulations, ...regulations };
-    if (eventChance !== undefined) this.config.eventChance = eventChance;
     if (details?.ranked !== undefined) this.config.ranked = details.ranked;
     if (details?.autoRecreateOnInactivity !== undefined) this.config.autoRecreateOnInactivity = details.autoRecreateOnInactivity;
     if (details?.title && details.title !== this.config.title) {
@@ -783,7 +1209,7 @@ export class LobbyController {
       await this.room.command(this.config.password ? `!mp password ${this.config.password}` : "!mp password");
     }
     await this.db.lobby.update({ where: { id: this.lobbyId }, data: { name: this.config.title, password: this.config.password, config: this.config as any } });
-    await this.room.say(`Lobby settings updated from the dashboard. ${this.regulationSummary()} Random events: ${(this.config.eventChance * 100).toFixed(0)}%. Ranking: ${this.config.ranked ? "enabled" : "disabled"}.`);
+    await this.room.say(`Lobby settings updated from the dashboard. ${this.regulationSummary()} Ranking: ${this.config.ranked ? "enabled" : "disabled"}.`);
   }
 
   private async updateMap() {

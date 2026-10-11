@@ -3,12 +3,23 @@ import type { Participant } from "../types.js";
 
 export interface RoomActivity { at: string; level: "info" | "error"; message: string; }
 
+export interface RoomMatchScore {
+  player: Participant;
+  score: number;
+  team?: "red" | "blue";
+  pass?: boolean;
+  misses?: number;
+  accuracy?: number;
+  combo?: number;
+}
+
 /** Narrow, testable boundary around bancho.js. The bot account is referee-only; it never joins a slot. */
 export interface RoomActions {
   say(message: string): Promise<void>; command(command: string): Promise<void>;
   setTitle(title: string): Promise<void>;
   players(): Participant[]; host(): Participant | undefined; beatmapId(): number | undefined;
   id(): number;
+  botUsername?(): string | undefined;
   onMessage(listener: (sender: Participant, text: string) => void): void;
   onPlayerJoined(listener: (player: Participant) => void): void;
   onPlayerLeft(listener: (player: Participant) => void): void;
@@ -18,7 +29,7 @@ export interface RoomActions {
   onHostChanged(listener: (host?: Participant) => void): void;
   onAllPlayersReady(listener: () => void): void;
   onMatchStarted(listener: () => void): void;
-  onMatchFinished(listener: (scores: Array<{ player: Participant; score: number; team?: "red" | "blue" }>) => void): void;
+  onMatchFinished(listener: (scores: RoomMatchScore[]) => void): void;
   onClosed(listener: () => void): void;
   onActivity(listener: (activity: RoomActivity) => void): void;
 }
@@ -62,7 +73,23 @@ export class BanchoGateway {
 }
 class BanchoRoom implements RoomActions {
   private readonly activityListeners = new Set<(activity: RoomActivity) => void>();
-  constructor(private channel: any, private limiter: BanchoRateLimiter) {}
+  private readonly recentMisses = new Map<string, number>();
+
+  constructor(private channel: any, private limiter: BanchoRateLimiter) {
+    this.channel.on("message", (message: any) => {
+      const text = message?.message ?? "";
+      // Regex extraction of misses from IRC post-match reports
+      const match = /(?:^|\s)([\w\s\-\[\]]+?)(?::|\s+finished|\s+-)\s*.*?(?:misses?|miss)[:\s]+(\d+)/i.exec(text);
+      if (match) {
+        const username = match[1].trim().toLowerCase();
+        const misses = parseInt(match[2], 10);
+        if (!isNaN(misses)) {
+          this.recentMisses.set(username, Math.max(0, misses));
+        }
+      }
+    });
+  }
+
   private activity(level: RoomActivity["level"], message: string) { const entry = { at: new Date().toISOString(), level, message }; for (const listener of this.activityListeners) listener(entry); }
   private participant(user: any, source: string): Participant | undefined {
     if (!user || !Number.isInteger(user.id) || !user.ircUsername) { this.activity("error", `${source}: Bancho sent an incomplete player payload.`); return; }
@@ -74,12 +101,13 @@ class BanchoRoom implements RoomActions {
   // Bancho's acknowledgement is not consistently emitted for client-created
   // tournament rooms, so send the command without waiting for that event.
   setTitle(title: string) { return this.send(`!mp name ${title}`, "Command"); }
-  players(): Participant[] { return (this.channel.lobby?.slots ?? []).filter((s: any) => s?.user).map((s: any) => ({ id: s.user.id, username: s.user.ircUsername })); }
+  players(): Participant[] { return (this.channel.lobby?.slots ?? []).filter((s: any) => s?.user).map((s: any) => ({ id: s.user.id, username: s.user.ircUsername, team: s.team === "Blue" || s.team === "blue" ? "Blue" : s.team === "Red" || s.team === "red" ? "Red" : undefined })); }
   host() { const h = this.channel.lobby?.getHost?.(); return h?.user ? { id: h.user.id, username: h.user.ircUsername } : undefined; }
   beatmapId() { return this.channel.lobby?.beatmapId; }
   id() { return this.channel.lobby.id; }
+  botUsername(): string | undefined { return this.channel.banchojs?.username ?? this.channel.client?.username; }
   onMessage(listener: (sender: Participant, text: string) => void) { this.channel.on("message", (m: any) => { const player = this.participant(m?.user, "Chat message"); if (player) listener(player, m.message); }); }
-  onPlayerJoined(listener: (player: Participant) => void) { this.channel.lobby.on("playerJoined", (e: any) => { const player = this.participant(e?.player?.user, "Player join"); if (player) listener(player); }); }
+  onPlayerJoined(listener: (player: Participant) => void) { this.channel.lobby.on("playerJoined", (e: any) => { const player = this.participant(e?.player?.user, "Player join"); if (player) { if (e?.player?.team) player.team = e.player.team.toLowerCase() === "blue" ? "Blue" : "Red"; listener(player); } }); }
   onPlayerLeft(listener: (player: Participant) => void) { this.channel.lobby.on("playerLeft", (player: any) => { const participant = this.participant(player?.user, "Player leave"); if (participant) listener(participant); }); }
   onBeatmapChanged(listener: (beatmapId: number) => void) { this.channel.lobby.on("beatmapId", listener); }
   onTitleChanged(listener: (title: string) => void) {
@@ -94,8 +122,37 @@ class BanchoRoom implements RoomActions {
   onPasswordChanged(listener: () => void) { this.channel.lobby.on("passwordChanged", listener); this.channel.lobby.on("passwordRemoved", listener); }
   onHostChanged(listener: (host?: Participant) => void) { this.channel.lobby.on("host", (player: any) => listener(player?.user ? this.participant(player.user, "Host change") : undefined)); }
   onAllPlayersReady(listener: () => void) { this.channel.lobby.on("allPlayersReady", listener); }
-  onMatchStarted(listener: () => void) { this.channel.lobby.on("matchStarted", listener); }
-  onMatchFinished(listener: (scores: any[]) => void) { this.channel.lobby.on("matchFinished", (scores: any[]) => listener(scores.flatMap((score: any) => { const player = this.participant(score?.player?.user, "Match result"); return player ? [{ player, score: score.score, team: score.player.team }] : []; }))); }
+  onMatchStarted(listener: () => void) {
+    this.recentMisses.clear();
+    this.channel.lobby.on("matchStarted", listener);
+  }
+  onMatchFinished(listener: (scores: RoomMatchScore[]) => void) {
+    this.channel.lobby.on("matchFinished", (scores: any[]) => listener(scores.flatMap((score: any) => {
+      const player = this.participant(score?.player?.user, "Match result");
+      if (!player) return [];
+      const userKey = player.username.toLowerCase();
+      const rawMisses = score?.misses ?? score?.countMiss ?? score?.count_miss ?? score?.statistics?.count_miss;
+      const parsedMisses = Number.isInteger(rawMisses)
+        ? rawMisses
+        : typeof rawMisses === "string" && !isNaN(Number(rawMisses))
+        ? parseInt(rawMisses, 10)
+        : this.recentMisses.get(userKey) ?? 0;
+      const rawAcc = score?.accuracy;
+      const parsedAcc = typeof rawAcc === "number" && !isNaN(rawAcc) ? rawAcc : 100.0;
+      const rawCombo = score?.maxCombo ?? score?.combo;
+      const parsedCombo = Number.isInteger(rawCombo) ? rawCombo : 0;
+
+      return [{
+        player,
+        score: typeof score?.score === "number" && !isNaN(score.score) ? score.score : 0,
+        team: score.player?.team ? (score.player.team.toLowerCase() as "red" | "blue") : undefined,
+        pass: score.pass ?? true,
+        misses: Math.max(0, parsedMisses),
+        accuracy: parsedAcc,
+        combo: Math.max(0, parsedCombo),
+      }];
+    })));
+  }
   onClosed(listener: () => void) { this.channel.on("PART", (member: any) => { if (member?.user?.isClient?.()) listener(); }); }
   onActivity(listener: (activity: RoomActivity) => void) { this.activityListeners.add(listener); }
 }

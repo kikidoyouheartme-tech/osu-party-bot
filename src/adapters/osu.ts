@@ -47,4 +47,19 @@ export class OsuApi {
     const index = (leaderboard.scores ?? []).findIndex(score => score.id === scoreId);
     return index === -1 ? undefined : index + 1;
   }
+  async userBestScores(userId: number, limit = 1): Promise<any[]> {
+    const response = await fetch(`https://osu.ppy.sh/api/v2/users/${userId}/scores/best?limit=${limit}&mode=osu`, {
+      headers: { Authorization: `Bearer ${await this.accessToken()}` },
+    });
+    if (!response.ok) throw new Error(`osu! best scores lookup failed (${response.status})`);
+    return response.json() as Promise<any[]>;
+  }
+
+  async userMostPlayed(userId: number, limit = 1): Promise<any[]> {
+    const response = await fetch(`https://osu.ppy.sh/api/v2/users/${userId}/beatmapsets/most_played?limit=${limit}`, {
+      headers: { Authorization: `Bearer ${await this.accessToken()}` },
+    });
+    if (!response.ok) throw new Error(`osu! most played lookup failed (${response.status})`);
+    return response.json() as Promise<any[]>;
+  }
 }
