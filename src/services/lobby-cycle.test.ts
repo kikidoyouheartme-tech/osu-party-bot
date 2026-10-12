@@ -2,6 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { rollNextMinigame, PARTY_MINIGAMES } from "./party-minigames.js";
 import { resolveMinigameMap } from "./party-map-pickers.js";
+import { checkMap, calculateModAdjustedStars } from "./party-regulation.js";
+import { normalizeMods, generateDefaultLobbyTitle, formatActiveMinigameRuleset } from "../lobby-controller.js";
+import { LobbyKeeper } from "../plugins/LobbyKeeper.js";
+import { MatchStarter } from "../plugins/MatchStarter.js";
+import { resetRoundLifecycleState, shouldBypassRegulations } from "./lobby-cycle.js";
 
 function getOrdinal(n: number): string {
   const s = ["th", "st", "nd", "rd"];
@@ -124,6 +129,34 @@ test("rollNextMinigame respects custom weights", () => {
   }
 });
 
+test("rollNextMinigame excludes PartyPoint Wager on round 1 but allows it on subsequent rounds", () => {
+  // On round 1, PartyPoint Wager must never be rolled
+  for (let i = 0; i < 100; i++) {
+    const rolled = rollNextMinigame(undefined, undefined, 1);
+    assert.notEqual(rolled.id, "partypoint-wager", "PartyPoint Wager must never be selected in round 1");
+  }
+
+  // Even if weights strongly favor PartyPoint Wager, round 1 must exclude it
+  const wagerFavoredWeights: Record<string, number> = {
+    "partypoint-wager": 1000,
+  };
+  for (let i = 0; i < 50; i++) {
+    const rolled = rollNextMinigame(undefined, wagerFavoredWeights, 1);
+    assert.notEqual(rolled.id, "partypoint-wager", "PartyPoint Wager must never be selected in round 1 even with high weight");
+  }
+
+  // On round 2 or later, PartyPoint Wager can be rolled
+  let rolledWagerInRound2 = false;
+  for (let i = 0; i < 50; i++) {
+    const rolled = rollNextMinigame(undefined, wagerFavoredWeights, 2);
+    if (rolled.id === "partypoint-wager") {
+      rolledWagerInRound2 = true;
+      break;
+    }
+  }
+  assert.ok(rolledWagerInRound2, "PartyPoint Wager should be selectable in round 2");
+});
+
 test("host retention logic on automated map picks vs host map picks", () => {
   let queue = [101, 102, 103];
   let currentHostId = queue[0];
@@ -156,8 +189,8 @@ test("host retention logic on automated map picks vs host map picks", () => {
 });
 
 test("chat command responses match exact ASCII bracketed specifications", () => {
-  const cmdsResponse = "[Commands] !cmds | !minigame | !round | !points | !pstats | !leaderboard | !bet <amount>";
-  assert.equal(cmdsResponse, "[Commands] !cmds | !minigame | !round | !points | !pstats | !leaderboard | !bet <amount>");
+  const cmdsResponse = "[Commands] !cmds | !minigame | !round | !points | !pstats | !leaderboard | !bet <amount> | !reroll";
+  assert.equal(cmdsResponse, "[Commands] !cmds | !minigame | !round | !points | !pstats | !leaderboard | !bet <amount> | !reroll");
 
   const roundResponse = `[Round] Current: ${4}/10 | Host: ${"PlayerOne"}`;
   assert.equal(roundResponse, "[Round] Current: 4/10 | Host: PlayerOne");
@@ -412,7 +445,7 @@ test("Host's Addiction resolves username fallback, returns no NF override, and h
   assert.equal(result.announcement, "Host's Addiction: AddictedHost's most played beatmap loaded.");
 });
 
-test("Wager responses use bracketed [Wager] prefix and PartyPoints balance against allTimePoints", async () => {
+test("Wager responses use bracketed [Wager] prefix and PartyPoints balance against sessionPoints", async () => {
   const chatMessages: string[] = [];
   const wagers = new Map<number, number>();
 
@@ -423,10 +456,10 @@ test("Wager responses use bracketed [Wager] prefix and PartyPoints balance again
   };
 
   const mockDb = {
-    player: {
-      findUnique: async ({ where }: { where: { id: number } }) => {
-        if (where.id === 1) return { id: 1, allTimePoints: 50 };
-        if (where.id === 2) return { id: 2, allTimePoints: 0 };
+    lobbyPlayer: {
+      findUnique: async ({ where }: { where: { lobbyId_playerId: { lobbyId: number; playerId: number } } }) => {
+        if (where.lobbyId_playerId.playerId === 1) return { lobbyId: 1, playerId: 1, sessionPoints: 50 };
+        if (where.lobbyId_playerId.playerId === 2) return { lobbyId: 1, playerId: 2, sessionPoints: 0 };
         return null;
       },
     },
@@ -452,9 +485,11 @@ test("Wager responses use bracketed [Wager] prefix and PartyPoints balance again
     if (!Number.isInteger(amount) || amount <= 0) {
       return void (await mockRoom.say("[Wager] Usage: !bet <positive integer amount> (e.g. !bet 5)."));
     }
-    const player = await mockDb.player.findUnique({ where: { id: p.id } });
-    const currentPoints = player?.allTimePoints ?? 0;
-    if (amount > currentPoints) {
+    const session = await mockDb.lobbyPlayer.findUnique({
+      where: { lobbyId_playerId: { lobbyId: 1, playerId: p.id } },
+    });
+    const currentPoints = Math.max(0, session?.sessionPoints ?? 0);
+    if (currentPoints <= 0 || amount > currentPoints) {
       return void (await mockRoom.say(
         `[Wager] ${p.username}: you only have ${currentPoints} PartyPoints to wager.`
       ));
@@ -477,14 +512,22 @@ test("Wager responses use bracketed [Wager] prefix and PartyPoints balance again
   await handleBet({ id: 1, username: "Alice" }, "invalid", "wager");
   assert.equal(chatMessages[2], "[Wager] Usage: !bet <positive integer amount> (e.g. !bet 5).");
 
-  // 4. Exceeds allTimePoints
+  // 4. Player with 0 session points cannot bet
   await handleBet({ id: 2, username: "Bob" }, "10", "wager");
   assert.equal(chatMessages[3], "[Wager] Bob: you only have 0 PartyPoints to wager.");
 
-  // 5. Valid bet using allTimePoints in round 1
+  // 5. Player with 0 session points attempting to bet 1 still rejected
+  await handleBet({ id: 2, username: "Bob" }, "1", "wager");
+  assert.equal(chatMessages[4], "[Wager] Bob: you only have 0 PartyPoints to wager.");
+
+  // 6. Exceeds sessionPoints
+  await handleBet({ id: 1, username: "Alice" }, "60", "wager");
+  assert.equal(chatMessages[5], "[Wager] Alice: you only have 50 PartyPoints to wager.");
+
+  // 7. Valid bet using sessionPoints
   await handleBet({ id: 1, username: "Alice" }, "20", "wager");
   assert.equal(
-    chatMessages[4],
+    chatMessages[6],
     "[Wager] Alice wagered 20 PartyPoints! Finish in the top placements to double it!"
   );
   assert.equal(wagers.get(1), 20);
@@ -964,7 +1007,6 @@ test("forced mods lock prevents host from removing or changing required mods", a
         this.isEnforcingMods = true;
         try {
           commandsSent.push(`!mp mods ${requiredMods}`);
-          chatMessages.push(`[Lock] Mods are locked for this minigame (${requiredMods}).`);
           this.currentLobbyMods = expectedTokens;
           this.freemod = false;
         } finally {
@@ -984,17 +1026,17 @@ test("forced mods lock prevents host from removing or changing required mods", a
   // Host tries to take off Flashlight (mods become ["HD"])
   await enforcer.enforceForcedMods(["HD"], false);
   assert.equal(commandsSent[commandsSent.length - 1], "!mp mods HD FL");
-  assert.equal(chatMessages[chatMessages.length - 1], "[Lock] Mods are locked for this minigame (HD FL).");
+  assert.equal(chatMessages.length, 0, "Enforcing forced mods should be silent without chat warnings");
 
   // Host tries to turn on FreeMod
   await enforcer.enforceForcedMods(["HD", "FL"], true);
   assert.equal(commandsSent[commandsSent.length - 1], "!mp mods HD FL");
-  assert.equal(chatMessages[chatMessages.length - 1], "[Lock] Mods are locked for this minigame (HD FL).");
+  assert.equal(chatMessages.length, 0, "Enforcing forced mods should be silent without chat warnings");
 
   // Host tries to add DoubleTime (mods become ["HD", "FL", "DT"])
   await enforcer.enforceForcedMods(["HD", "FL", "DT"], false);
   assert.equal(commandsSent[commandsSent.length - 1], "!mp mods HD FL");
-  assert.equal(chatMessages[chatMessages.length - 1], "[Lock] Mods are locked for this minigame (HD FL).");
+  assert.equal(chatMessages.length, 0, "Enforcing forced mods should be silent without chat warnings");
 
   // When mods match expected, no lock command is sent
   const beforeLen = commandsSent.length;
@@ -1009,7 +1051,1263 @@ test("forced mods lock prevents host from removing or changing required mods", a
   assert.equal(commandsSent.length, beforeLen, "Should not restrict mods when no forced mods are active");
 });
 
+test("!reroll majority vote re-rolls minigame while retaining host and current round", async () => {
+  const chatMessages: string[] = [];
+  const rerollVotes = new Set<number>();
+  let currentRound = 4;
+  let queue = [101, 102, 103];
+  let wasHostMapPick = true;
+  let rolledGameId = "classic-showdown";
+  let matchActive = false;
 
+  const humanPlayers = [
+    { id: 101, username: "PlayerA" },
+    { id: 102, username: "PlayerB" },
+    { id: 103, username: "PlayerC" },
+  ];
 
+  async function voteReroll(p: { id: number; username: string }) {
+    if (matchActive) {
+      chatMessages.push(`${p.username}: cannot reroll during an active match.`);
+      return;
+    }
+    const activeCount = Math.max(1, humanPlayers.length);
+    const requiredVotes = activeCount <= 2 ? activeCount : Math.floor(activeCount / 2) + 1;
+
+    if (rerollVotes.has(p.id)) {
+      chatMessages.push(`${p.username}: you have already voted to reroll (${rerollVotes.size}/${requiredVotes} needed).`);
+      return;
+    }
+
+    rerollVotes.add(p.id);
+    const currentVotes = rerollVotes.size;
+    chatMessages.push(`[Vote] ${p.username} voted to reroll the minigame! (${currentVotes}/${requiredVotes} needed)`);
+
+    if (currentVotes >= requiredVotes) {
+      rerollVotes.clear();
+      chatMessages.push("[Reroll] Vote passed! Rolling a new minigame...");
+      // Host retention rule: queue is NOT rotated, wasHostMapPick preserved, currentRound unchanged
+      rolledGameId = "precision-master";
+    }
+  }
+
+  // Active match test: voting blocked
+  matchActive = true;
+  await voteReroll(humanPlayers[0]);
+  assert.equal(chatMessages[chatMessages.length - 1], "PlayerA: cannot reroll during an active match.");
+  matchActive = false;
+  chatMessages.length = 0;
+
+  // 3-player lobby: required votes = Math.floor(3/2) + 1 = 2
+  await voteReroll(humanPlayers[0]);
+  assert.equal(chatMessages[0], "[Vote] PlayerA voted to reroll the minigame! (1/2 needed)");
+
+  // Duplicate vote from PlayerA
+  await voteReroll(humanPlayers[0]);
+  assert.equal(chatMessages[1], "PlayerA: you have already voted to reroll (1/2 needed).");
+
+  // PlayerB votes -> reaches 2/2 threshold
+  await voteReroll(humanPlayers[1]);
+  assert.equal(chatMessages[2], "[Vote] PlayerB voted to reroll the minigame! (2/2 needed)");
+  assert.equal(chatMessages[3], "[Reroll] Vote passed! Rolling a new minigame...");
+
+  // Host retention assertions
+  assert.equal(queue[0], 101, "Current host must retain host turn");
+  assert.equal(currentRound, 4, "Current round must not advance on reroll");
+  assert.equal(wasHostMapPick, true, "wasHostMapPick must be preserved");
+  assert.equal(rolledGameId, "precision-master", "A new minigame must be rolled");
+
+  // 2-player lobby test: requires 2 votes (at least 2 in 2-player lobby)
+  const twoPlayers = [humanPlayers[0], humanPlayers[1]];
+  chatMessages.length = 0;
+  rerollVotes.clear();
+  const req2 = twoPlayers.length <= 2 ? twoPlayers.length : Math.floor(twoPlayers.length / 2) + 1;
+  assert.equal(req2, 2, "2-player lobby requires 2 votes for reroll");
+});
+
+test("mod-adjusted beatmap star rating and regulation enforcement for forced DT/HR", async () => {
+  const regulations = {
+    enabled: true,
+    minStar: 4.0,
+    maxStar: 8.0,
+    allowConvert: false,
+    freeMod: false,
+  };
+
+  // 1. Fallback calculation multipliers
+  assert.equal(calculateModAdjustedStars(6.0, "DT"), 8.28);
+  assert.equal(calculateModAdjustedStars(5.5, "HR"), 6.16);
+  assert.equal(calculateModAdjustedStars(5.0, "DT"), 6.90);
+  assert.equal(calculateModAdjustedStars(5.0, ""), 5.0);
+
+  // 2. Speedom (DT) with 6.00★ map -> 8.28★ under DT exceeds 8.00★ max
+  const freedomDive = {
+    id: 129891,
+    beatmapsetId: 39804,
+    title: "FREEDOM DiVE",
+    artist: "xi",
+    version: "FOUR DIMENSIONS",
+    stars: 6.0,
+    length: 250,
+    mode: "osu" as const,
+    converted: false,
+    status: "ranked",
+    bpm: 222,
+    ar: 9,
+    hp: 7,
+    od: 9,
+    cs: 4,
+  };
+
+  const dtReason = checkMap(freedomDive, regulations, "DT");
+  assert.ok(dtReason, "Map should be rejected under DT");
+  assert.equal(
+    `[Regulations] Map rejected: ${dtReason}. Please select another map!`,
+    "[Regulations] Map rejected: FREEDOM DiVE is 8.28★ with DT (Max allowed: 8★). Please select another map!"
+  );
+
+  // 3. Pixel Perfect (HR) with 5.50★ map when maxStar is 6.00★ -> 6.16★ exceeds 6.00★
+  const blueZenith = {
+    ...freedomDive,
+    title: "Blue Zenith",
+    stars: 5.5,
+  };
+  const hrRegulations = { ...regulations, maxStar: 6.0 };
+  const hrReason = checkMap(blueZenith, hrRegulations, "HR");
+  assert.ok(hrReason, "Map should be rejected under HR");
+  assert.equal(
+    `[Regulations] Map rejected: ${hrReason}. Please select another map!`,
+    "[Regulations] Map rejected: Blue Zenith is 6.16★ with HR (Max allowed: 6★). Please select another map!"
+  );
+
+  // 4. Map compliant under DT (5.0★ -> 6.90★ <= 8.0★)
+  const compliantMap = {
+    ...freedomDive,
+    title: "Compliant Map",
+    stars: 5.0,
+  };
+  const compliantReason = checkMap(compliantMap, regulations, "DT");
+  assert.equal(compliantReason, undefined, "Compliant map should not be rejected");
+
+  // 5. MinStar check with forced mods
+  const easyMap = {
+    ...freedomDive,
+    title: "Too Easy Map",
+    stars: 2.0,
+  };
+  const minStarRegulations = { ...regulations, minStar: 4.0 };
+  const minReason = checkMap(easyMap, minStarRegulations, "DT");
+  assert.ok(minReason);
+  assert.equal(
+    `[Regulations] Map rejected: ${minReason}. Please select another map!`,
+    "[Regulations] Map rejected: Too Easy Map is 2.76★ with DT (Min required: 4★). Please select another map!"
+  );
+
+  // 6. Explicit adjustedStars override from API difficulty attributes
+  const apiOverriddenReason = checkMap(freedomDive, regulations, "DT", 8.45);
+  assert.equal(
+    `[Regulations] Map rejected: ${apiOverriddenReason}. Please select another map!`,
+    "[Regulations] Map rejected: FREEDOM DiVE is 8.45★ with DT (Max allowed: 8★). Please select another map!"
+  );
+});
+
+test("mod spam prevention deduplicates !mp mods and avoids unreadying players", async () => {
+  const commandsSent: string[] = [];
+
+  function normalizeMods(mods: string | string[]): string {
+    const list = Array.isArray(mods) ? mods : mods.split(/\s+/);
+    return list
+      .map(m => m.trim().toUpperCase())
+      .filter(m => m && m !== "NONE")
+      .sort()
+      .join(" ");
+  }
+
+  let activeRoomMods = "";
+  let activeFreemod = false;
+  let currentForcedMods: string | undefined = "HD FL";
+
+  async function handlePlayerJoined(targetForcedMods?: string) {
+    const targetMods = targetForcedMods ?? "";
+    const targetNormalized = normalizeMods(targetMods);
+
+    if (targetMods) {
+      if (activeRoomMods !== targetNormalized || activeFreemod) {
+        activeRoomMods = targetNormalized;
+        activeFreemod = false;
+        commandsSent.push(`!mp mods ${targetMods}`);
+      }
+    } else {
+      if (!activeFreemod) {
+        activeRoomMods = "";
+        activeFreemod = true;
+        commandsSent.push("!mp mods freemod");
+      }
+    }
+  }
+
+  // Initial round setup sends !mp mods once
+  activeRoomMods = normalizeMods(currentForcedMods);
+  activeFreemod = false;
+  commandsSent.push(`!mp mods ${currentForcedMods}`);
+  assert.equal(commandsSent.length, 1);
+
+  // Player joins when room already has target mods: NO command sent
+  await handlePlayerJoined(currentForcedMods);
+  assert.equal(commandsSent.length, 1, "Must not re-send !mp mods when room mods already match");
+
+  // Another player joins: still NO command sent
+  await handlePlayerJoined(currentForcedMods);
+  assert.equal(commandsSent.length, 1, "Must not re-send !mp mods for second player join");
+
+  // Only if room mods somehow desynced (e.g. freemod became true) does it re-issue
+  activeFreemod = true;
+  await handlePlayerJoined(currentForcedMods);
+  assert.equal(commandsSent.length, 2, "Re-issues command if room mods desynced");
+});
+
+test("match guard silently enforces room title, password, team mode and win condition without chat warnings", async () => {
+  const commandsSent: string[] = [];
+  const chatMessages: string[] = [];
+
+  class MockGuard {
+    config = { title: "osu!Party Grand Prix", password: "secretPassword" };
+    currentMinigame = { teamMode: 2, scoreMode: 1, forcedMods: "" };
+
+    async handleTitleChange(incomingTitle: string) {
+      if (incomingTitle !== this.config.title) {
+        commandsSent.push(`!mp name ${this.config.title}`);
+      }
+    }
+
+    async handlePasswordChange(incomingPassword?: string) {
+      if (incomingPassword !== this.config.password) {
+        commandsSent.push(`!mp password ${this.config.password || ""}`);
+      }
+    }
+
+    async enforceMatchSettings(teamMode?: number, winCondition?: number) {
+      const targetTeam = this.currentMinigame.teamMode;
+      const targetScore = this.currentMinigame.scoreMode;
+      if (teamMode !== targetTeam || winCondition !== targetScore) {
+        commandsSent.push(`!mp set ${targetTeam} ${targetScore}`);
+      }
+    }
+  }
+
+  const guard = new MockGuard();
+
+  // Host renames room: silently reverts to target title without chat warning
+  await guard.handleTitleChange("Host's Custom Room Name");
+  assert.equal(commandsSent[commandsSent.length - 1], "!mp name osu!Party Grand Prix");
+  assert.equal(chatMessages.length, 0, "No chat warning should be sent on title change");
+
+  // Host changes password: silently reverts to target password without chat warning
+  await guard.handlePasswordChange(undefined);
+  assert.equal(commandsSent[commandsSent.length - 1], "!mp password secretPassword");
+  assert.equal(chatMessages.length, 0, "No chat warning should be sent on password change");
+
+  // Host changes dropdowns to HeadToHead (0) & Score (0) instead of TeamVS (2) & Accuracy (1)
+  // Must enforce both compound parameters: !mp set <teammode> <scoremode>
+  await guard.enforceMatchSettings(0, 0);
+  assert.equal(commandsSent[commandsSent.length - 1], "!mp set 2 1");
+  assert.equal(chatMessages.length, 0, "No chat warning should be sent on match settings revert");
+
+  // Matching settings do not trigger commands
+  const beforeLen = commandsSent.length;
+  await guard.enforceMatchSettings(2, 1);
+  assert.equal(commandsSent.length, beforeLen, "Should not trigger revert when settings match");
+});
+
+test("deferred room metadata validation restores title and password post-round and upon host-pass without mid-game spam", async () => {
+  const commandsSent: string[] = [];
+  const chatMessages: string[] = [];
+
+  class MockDelayedMetadataController {
+    config = { title: "osu!Party Grand Prix", password: "secretPassword" };
+    matchId?: number;
+    currentRoomTitle = "osu!Party Grand Prix";
+    currentRoomPassword: string | undefined = "secretPassword";
+
+    room = {
+      command: async (cmd: string) => {
+        commandsSent.push(cmd);
+      },
+      say: async (msg: string) => {
+        chatMessages.push(msg);
+      },
+      name: () => this.currentRoomTitle,
+      password: () => this.currentRoomPassword,
+    };
+
+    handleTitleChange(newTitle: string) {
+      this.currentRoomTitle = newTitle;
+    }
+
+    handlePasswordChange(newPassword?: string) {
+      this.currentRoomPassword = newPassword;
+    }
+
+    async validateRoomMetadata() {
+      const targetLobbyTitle = this.config.title;
+      const targetLobbyPassword = this.config.password;
+      const currentRoomName = this.room.name() ?? this.currentRoomTitle;
+      const currentRoomPassword = this.room.password() ?? this.currentRoomPassword;
+
+      if (targetLobbyTitle && currentRoomName !== targetLobbyTitle) {
+        await this.room.command(`!mp name ${targetLobbyTitle}`);
+        this.currentRoomTitle = targetLobbyTitle;
+      }
+
+      const normalizedTargetPassword = targetLobbyPassword || undefined;
+      const normalizedCurrentPassword = currentRoomPassword || undefined;
+      if (normalizedCurrentPassword !== normalizedTargetPassword) {
+        await this.room.command(`!mp password ${targetLobbyPassword || ""}`);
+        this.currentRoomPassword = targetLobbyPassword;
+      }
+    }
+
+    async onRoundComplete() {
+      await this.validateRoomMetadata();
+    }
+
+    async onHostChanged() {
+      if (this.matchId) return;
+      await this.validateRoomMetadata();
+    }
+  }
+
+  const controller = new MockDelayedMetadataController();
+
+  // 1. Start match (active gameplay)
+  controller.matchId = 1;
+
+  // 2. Host alters title and password during active gameplay
+  controller.handleTitleChange("Random Host Title 123");
+  controller.handlePasswordChange("hackedPass");
+
+  // Verify that during active gameplay, NO commands or chat warnings are sent
+  assert.equal(commandsSent.length, 0, "No commands should be sent mid-game when title/password are changed");
+  assert.equal(chatMessages.length, 0, "No chat warnings should be spammed during active gameplay");
+
+  // 3. Round finishes -> onRoundComplete executes
+  controller.matchId = undefined;
+  await controller.onRoundComplete();
+
+  // Verify room title and password are both silently corrected without chat spam
+  assert.ok(commandsSent.includes("!mp name osu!Party Grand Prix"), "Should restore target title after round ends");
+  assert.ok(commandsSent.includes("!mp password secretPassword"), "Should restore target password after round ends");
+  assert.equal(chatMessages.length, 0, "Quiet enforcement must not spam chat warnings");
+  assert.equal(controller.currentRoomTitle, "osu!Party Grand Prix");
+  assert.equal(controller.currentRoomPassword, "secretPassword");
+
+  // 4. Host rotates between rounds: if host changes password before map selection
+  commandsSent.length = 0;
+  controller.handlePasswordChange(undefined);
+  await controller.onHostChanged();
+
+  assert.equal(commandsSent[0], "!mp password secretPassword", "Should restore password when host rotates");
+  assert.equal(chatMessages.length, 0, "Host change check must also be quiet without chat spam");
+});
+
+test("star rating floating-point tolerance buffer allows slight decimal overflows and underflows within ±0.10★", () => {
+  const regulations = {
+    enabled: true,
+    minStar: 4.0,
+    maxStar: 8.0,
+    allowConvert: false,
+    freeMod: false,
+  };
+  const baseMap = {
+    id: 1,
+    beatmapsetId: 1,
+    title: "Tolerance Test Map",
+    artist: "Artist",
+    version: "Diff",
+    stars: 8.05,
+    length: 120,
+    mode: "osu" as const,
+    converted: false,
+    status: "ranked",
+    bpm: 180,
+    ar: 9,
+    hp: 7,
+    od: 8,
+    cs: 4,
+  };
+
+  // 8.05★ passes an 8.0★ limit (effectiveStars <= maxStar + 0.10)
+  assert.equal(checkMap({ ...baseMap, stars: 8.05 }, regulations), undefined);
+  // 8.10★ passes an 8.0★ limit
+  assert.equal(checkMap({ ...baseMap, stars: 8.10 }, regulations), undefined);
+  // 8.11★ exceeds 8.0★ + 0.10 tolerance and is rejected
+  assert.ok(checkMap({ ...baseMap, stars: 8.11 }, regulations));
+
+  // 3.95★ passes a 4.0★ minStar limit (effectiveStars >= minStar - 0.10)
+  assert.equal(checkMap({ ...baseMap, stars: 3.95 }, regulations), undefined);
+  // 3.90★ passes a 4.0★ minStar limit
+  assert.equal(checkMap({ ...baseMap, stars: 3.90 }, regulations), undefined);
+  // 3.89★ is below 4.0★ - 0.10 tolerance and is rejected
+  assert.ok(checkMap({ ...baseMap, stars: 3.89 }, regulations));
+});
+
+test("automated special map does not pollute lastValidMapId or roll over to subsequent host round", async () => {
+  const commandsSent: string[] = [];
+  const chatMessages: string[] = [];
+
+  class MockRolloverController {
+    currentMinigame?: { id: string; name: string; mapPicker: "host" | "automated" };
+    lastValidMapId?: number;
+    automatedBeatmapId?: number;
+
+    regulations = {
+      enabled: true,
+      minStar: 4.0,
+      maxStar: 6.0,
+    };
+
+    mapDatabase: Record<number, any> = {
+      100: { id: 100, title: "Automated Boss Map", stars: 7.5, length: 300, mode: "osu", status: "ranked", bpm: 200, converted: false },
+      200: { id: 200, title: "Host Invalid Map", stars: 7.2, length: 150, mode: "osu", status: "ranked", bpm: 180, converted: false },
+      300: { id: 300, title: "Host Valid Map", stars: 5.0, length: 150, mode: "osu", status: "ranked", bpm: 180, converted: false },
+    };
+
+    // Round 1: Automated minigame
+    prepareAutomatedRound() {
+      this.lastValidMapId = undefined;
+      this.automatedBeatmapId = 100;
+      this.currentMinigame = { id: "boss-battle", name: "Boss Battle", mapPicker: "automated" };
+      commandsSent.push("!mp map 100");
+    }
+
+    // validateSelection logic matching lobby-controller
+    async validateSelection(mapId: number) {
+      if (this.currentMinigame && this.currentMinigame.mapPicker !== "host") {
+        if (this.automatedBeatmapId && mapId !== this.automatedBeatmapId) {
+          commandsSent.push(`!mp map ${this.automatedBeatmapId}`);
+        }
+        return; // Automated picks never set lastValidMapId
+      }
+
+      const map = this.mapDatabase[mapId];
+      const reason = checkMap(map, this.regulations as any);
+      if (!reason) {
+        this.lastValidMapId = mapId;
+        chatMessages.push(`Selected map: ${map.title}`);
+        return;
+      }
+
+      if (this.lastValidMapId) {
+        commandsSent.push(`!mp map ${this.lastValidMapId}`);
+        chatMessages.push(`Map rejected: ${reason}. Reverted to the previous valid map.`);
+      } else {
+        chatMessages.push(`Map rejected: ${reason}. Select a regulation-compliant map.`);
+      }
+    }
+
+    // Transition to Round 2: Host Pick minigame
+    prepareHostRound() {
+      this.lastValidMapId = undefined;
+      this.automatedBeatmapId = undefined;
+      this.currentMinigame = { id: "classic", name: "Classic Party", mapPicker: "host" };
+    }
+  }
+
+  const controller = new MockRolloverController();
+
+  // 1. Round 1: Automated Boss Battle loads map 100
+  controller.prepareAutomatedRound();
+  await controller.validateSelection(100);
+  assert.equal(controller.lastValidMapId, undefined, "Automated pick must never set lastValidMapId");
+
+  // If a player attempted to change map during automated pick, it reverts silently to 100 without [Lock]
+  await controller.validateSelection(999);
+  assert.equal(commandsSent[commandsSent.length - 1], "!mp map 100");
+  assert.equal(chatMessages.length, 0, "Automated map revert must not send [Lock] chat warning");
+
+  // 2. Round 2: Next minigame is a Host Pick round
+  controller.prepareHostRound();
+  assert.equal(controller.lastValidMapId, undefined, "lastValidMapId must be undefined going into host round");
+
+  // 3. Host selects invalid map 200 (7.2★ > 6.0★ limit)
+  await controller.validateSelection(200);
+
+  // CRITICAL CHECK: It must NOT revert to map 100 from Round 1!
+  const revertedTo100 = commandsSent.slice(2).some(cmd => cmd === "!mp map 100");
+  assert.equal(revertedTo100, false, "Must not revert to automated map from previous round");
+  assert.ok(chatMessages.some(msg => msg.includes("Select a regulation-compliant map")), "Must prompt host to select a compliant map");
+
+  // 4. Host selects valid map 300 (5.0★)
+  await controller.validateSelection(300);
+  assert.equal(controller.lastValidMapId, 300, "Valid host pick sets lastValidMapId");
+
+  // 5. Host now selects invalid map 200 again in the same round -> should revert to valid map 300
+  await controller.validateSelection(200);
+  assert.equal(commandsSent[commandsSent.length - 1], "!mp map 300", "Reverts to host's valid map in this round");
+});
+
+test("extra user-added mods are automatically overwritten by forcedMods with alias normalization", async () => {
+  const commandsSent: string[] = [];
+  const chatMessages: string[] = [];
+
+  class MockForcedModsController {
+    currentMinigame?: { forcedMods: string };
+    currentForcedMods?: string;
+    isEnforcingMods = false;
+    currentLobbyMods: string[] = [];
+    freemod = false;
+
+    async enforceForcedMods(currentMods?: string[], isFreemod?: boolean) {
+      if (this.isEnforcingMods) return;
+      const requiredMods = this.currentForcedMods ?? (this.currentMinigame?.forcedMods || undefined);
+      const targetNormalized = normalizeMods(requiredMods ?? "");
+
+      const normalizedIncoming = normalizeMods(currentMods ?? this.currentLobbyMods);
+      const freemodActive = isFreemod !== undefined ? isFreemod : this.freemod;
+
+      if (requiredMods) {
+        if (normalizedIncoming === targetNormalized && !freemodActive) {
+          this.currentLobbyMods = targetNormalized.split(" ").filter(Boolean);
+          this.freemod = false;
+          return;
+        }
+        this.isEnforcingMods = true;
+        this.currentLobbyMods = targetNormalized.split(" ").filter(Boolean);
+        this.freemod = false;
+        try {
+          commandsSent.push(`!mp mods ${requiredMods}`);
+        } finally {
+          this.isEnforcingMods = false;
+        }
+      } else {
+        if (freemodActive) {
+          this.freemod = true;
+          return;
+        }
+        this.isEnforcingMods = true;
+        this.currentLobbyMods = [];
+        this.freemod = true;
+        try {
+          commandsSent.push("!mp mods freemod");
+        } finally {
+          this.isEnforcingMods = false;
+        }
+      }
+    }
+  }
+
+  const controller = new MockForcedModsController();
+
+  // 1. Minigame has forcedMods: "HR"
+  controller.currentMinigame = { forcedMods: "HR" };
+  controller.currentForcedMods = "HR";
+  controller.currentLobbyMods = ["HR"];
+
+  // Host attempts to layer extra mod: DT on top of HR
+  await controller.enforceForcedMods(["HR", "DT"], false);
+  assert.equal(commandsSent[commandsSent.length - 1], "!mp mods HR", "Must re-issue forced HR when DT is added");
+  assert.equal(chatMessages.length, 0, "No chat noise on mod correction");
+
+  // Host attempts to add DoubleTime using full alias
+  await controller.enforceForcedMods(["HardRock", "DoubleTime"], false);
+  assert.equal(commandsSent[commandsSent.length - 1], "!mp mods HR", "Must recognize full mod names and overwrite");
+
+  // Host attempts to remove HR (mods cleared to none)
+  await controller.enforceForcedMods([], false);
+  assert.equal(commandsSent[commandsSent.length - 1], "!mp mods HR", "Must re-issue HR when host removes it");
+
+  // Host attempts to replace HR with HD
+  await controller.enforceForcedMods(["HD"], false);
+  assert.equal(commandsSent[commandsSent.length - 1], "!mp mods HR", "Must overwrite unauthorized HD with HR");
+
+  // Host attempts to turn on FreeMod
+  await controller.enforceForcedMods(["HR"], true);
+  assert.equal(commandsSent[commandsSent.length - 1], "!mp mods HR", "Must disable FreeMod and enforce HR");
+
+  // Room receives exact required mod: no extra command dispatched
+  const countBefore = commandsSent.length;
+  await controller.enforceForcedMods(["HR"], false);
+  assert.equal(commandsSent.length, countBefore, "Must not loop when mods match target");
+
+  // 2. Multi-mod forced minigame: "HD FL"
+  controller.currentMinigame = { forcedMods: "HD FL" };
+  controller.currentForcedMods = "HD FL";
+  controller.currentLobbyMods = ["HD", "FL"];
+
+  // Host layers DT on top of HD FL
+  await controller.enforceForcedMods(["HD", "FL", "DT"], false);
+  assert.equal(commandsSent[commandsSent.length - 1], "!mp mods HD FL", "Must re-apply exact HD FL when extra mod is layered");
+
+  // Host removes Flashlight
+  await controller.enforceForcedMods(["HD"], false);
+  assert.equal(commandsSent[commandsSent.length - 1], "!mp mods HD FL", "Must restore Flashlight when host removes it");
+});
+
+test("all-ready states trigger !mp start silently without sending any chat text", async () => {
+  const commandsSent: string[] = [];
+  const chatMessages: string[] = [];
+
+  class MockAutoStartController {
+    matchId?: number;
+    beatmapId?: number = 12345;
+    isLaunching = false;
+    timerCleared = false;
+
+    room = {
+      beatmapId: () => this.beatmapId,
+      say: async (msg: string) => {
+        chatMessages.push(msg);
+      },
+      command: async (cmd: string) => {
+        commandsSent.push(cmd);
+      },
+    };
+
+    clearTurnTimer() {
+      this.timerCleared = true;
+    }
+
+    stopTimer() {
+      this.timerCleared = true;
+    }
+
+    async launch(mapId: number) {
+      if (this.matchId || this.isLaunching) return;
+      this.isLaunching = true;
+      try {
+        this.matchId = 1;
+        await this.room.command("!mp start");
+      } finally {
+        this.isLaunching = false;
+      }
+    }
+
+    async allPlayersReady() {
+      const mapId = this.room.beatmapId();
+      if (!mapId || this.matchId) return;
+      this.clearTurnTimer();
+      this.stopTimer();
+      await this.launch(mapId);
+    }
+  }
+
+  const controller = new MockAutoStartController();
+
+  // 1. All players transition to ready state with map selected
+  await controller.allPlayersReady();
+
+  // Must immediately dispatch !mp start
+  assert.equal(commandsSent.length, 1, "Should dispatch exactly one start command");
+  assert.equal(commandsSent[0], "!mp start", "Must issue !mp start");
+
+  // CRITICAL REQUIREMENT: Zero chat noise
+  assert.equal(chatMessages.length, 0, "Must not broadcast any text or countdowns to room chat");
+  assert.equal(controller.timerCleared, true, "Turn and start countdown timers must be cleared");
+  assert.equal(controller.matchId, 1, "Match ID must be active");
+
+  // 2. Duplicate or redundant all-ready triggers while match is ongoing do nothing
+  await controller.allPlayersReady();
+  assert.equal(commandsSent.length, 1, "Must not issue duplicate !mp start when match already started");
+  assert.equal(chatMessages.length, 0, "Still no chat messages emitted");
+});
+
+test("LobbyKeeper silently enforces title, password, compound settings, and forced mods without chat warnings", async () => {
+  const commandsSent: string[] = [];
+  const logEntries: string[] = [];
+  let currentTitle = "osu!Party Lobby [5-8*]";
+  let currentPassword: string | undefined = "party123";
+  let currentTeamMode = 0;
+  let currentWinCondition = 0;
+  let currentMods: string[] = ["HR"];
+  let freemodActive = false;
+
+  let titleListener: ((title: string) => void) | undefined;
+  let passwordListener: (() => void) | undefined;
+  let settingsListener: ((team: number, win: number) => void) | undefined;
+  let modsListener: ((mods: string[], freemod: boolean) => void) | undefined;
+
+  const mockRoom: any = {
+    command: async (cmd: string) => { commandsSent.push(cmd); },
+    name: () => currentTitle,
+    password: () => currentPassword,
+    teamMode: () => currentTeamMode,
+    winCondition: () => currentWinCondition,
+    mods: () => currentMods,
+    freemod: () => freemodActive,
+    onTitleChanged: (fn: (title: string) => void) => { titleListener = fn; },
+    onPasswordChanged: (fn: () => void) => { passwordListener = fn; },
+    onSettingsChanged: (fn: (team: number, win: number) => void) => { settingsListener = fn; },
+    onModsChanged: (fn: (mods: string[], freemod: boolean) => void) => { modsListener = fn; },
+  };
+
+  const config: any = {
+    title: "osu!Party Lobby [5-8*]",
+    password: "party123",
+    mods: ["HR"],
+    locks: { mods: true },
+  };
+
+  const currentMinigame = {
+    id: "pixel-perfect",
+    teamMode: 0,
+    scoreMode: 0,
+    forcedMods: "HR",
+  };
+
+  const keeper = new LobbyKeeper({
+    room: mockRoom,
+    getConfig: () => config,
+    getCurrentMinigame: () => currentMinigame,
+    getCurrentForcedMods: () => currentMinigame.forcedMods,
+    logActivity: (lvl, msg) => { logEntries.push(msg); },
+  });
+
+  keeper.bindListeners();
+  assert.ok(titleListener, "Title listener must be bound");
+  assert.ok(passwordListener, "Password listener must be bound");
+  assert.ok(settingsListener, "Settings listener must be bound");
+  assert.ok(modsListener, "Mods listener must be bound");
+
+  // 1. Host alters title -> silently restored via !mp name
+  titleListener!("My Custom Title");
+  await keeper.enforceTitle("My Custom Title");
+  assert.equal(commandsSent[commandsSent.length - 1], "!mp name osu!Party Lobby [5-8*]");
+  assert.ok(logEntries.some(l => l.includes("Restored room title")));
+
+  // 2. Host alters password -> silently restored via !mp password
+  currentPassword = "hackedpassword";
+  passwordListener!();
+  await keeper.enforcePassword("hackedpassword");
+  assert.equal(commandsSent[commandsSent.length - 1], "!mp password party123");
+  assert.ok(logEntries.some(l => l.includes("Restored room password")));
+
+  // 3. Host alters settings to Team VS Accuracy (2, 1) -> silently restored via compound !mp set 0 0
+  settingsListener!(2, 1);
+  await keeper.enforceMatchSettings(2, 1);
+  assert.equal(commandsSent[commandsSent.length - 1], "!mp set 0 0", "Must use compound !mp set syntax");
+  assert.ok(logEntries.some(l => l.includes("Restored match settings")));
+
+  // 4. Host adds DT to forced HR -> silently re-issues !mp mods HR
+  modsListener!(["HR", "DT"], false);
+  await keeper.enforceForcedMods(["HR", "DT"], false);
+  assert.equal(commandsSent[commandsSent.length - 1], "!mp mods HR");
+  assert.ok(logEntries.some(l => l.includes("Re-applied forced mods")));
+
+  // 5. Normalization prevents duplicate loops when incoming mods match
+  const countBefore = commandsSent.length;
+  await keeper.enforceForcedMods(["HardRock"], false);
+  assert.equal(commandsSent.length, countBefore, "Must recognize alias and not loop");
+});
+
+test("MatchStarter executes silent auto-start immediately when all players ready without chat noise", async () => {
+  const commandsSent: string[] = [];
+  const logEntries: string[] = [];
+  let timersCleared = false;
+  let matchActive = false;
+  let launchedMapId: number | undefined;
+
+  let readyListener: (() => void) | undefined;
+
+  const mockRoom: any = {
+    beatmapId: () => 987654,
+    onAllPlayersReady: (fn: () => void) => { readyListener = fn; },
+  };
+
+  const starter = new MatchStarter({
+    room: mockRoom,
+    isMatchActive: () => matchActive,
+    onClearTimers: () => { timersCleared = true; },
+    onAutoStart: async (mapId) => {
+      matchActive = true;
+      launchedMapId = mapId;
+      commandsSent.push("!mp start");
+    },
+    logActivity: (lvl, msg) => { logEntries.push(msg); },
+  });
+
+  starter.bindListeners();
+  assert.ok(readyListener, "All players ready listener must be bound");
+
+  // 1. Trigger all players ready
+  await starter.triggerAutoStart();
+
+  assert.equal(timersCleared, true, "Timers must be cleared");
+  assert.equal(launchedMapId, 987654, "Must launch active beatmap ID");
+  assert.equal(commandsSent[0], "!mp start", "Must issue !mp start");
+  assert.ok(logEntries.some(l => l.includes("All players ready, launching match")));
+
+  // 2. Subsequent ready trigger while match is active is ignored
+  const countBefore = commandsSent.length;
+  await starter.triggerAutoStart();
+  assert.equal(commandsSent.length, countBefore, "Must not trigger start when match is active");
+});
+
+test("resetRoundLifecycleState cleanly isolates round states and shouldBypassRegulations handles minigame pickers", () => {
+  const state = resetRoundLifecycleState();
+  assert.equal(state.automatedBeatmapId, undefined);
+  assert.equal(state.lastValidMapId, undefined);
+  assert.equal(state.currentForcedMods, undefined);
+  assert.equal(state.targetAccuracy, undefined);
+  assert.equal(state.wasHostMapPick, true);
+
+  // Host picks must enforce regulations (bypass === false)
+  assert.equal(shouldBypassRegulations({ mapPicker: "host" }), false);
+  assert.equal(shouldBypassRegulations(undefined), false);
+
+  // Automated/bot picks must completely bypass regulations (bypass === true)
+  assert.equal(shouldBypassRegulations({ mapPicker: "bot_pool_community_choice" }), true);
+  assert.equal(shouldBypassRegulations({ mapPicker: "bot_api_host_top" }), true);
+  assert.equal(shouldBypassRegulations({ mapPicker: "bot_api_host_most_played" }), true);
+  assert.equal(shouldBypassRegulations({ mapPicker: "bot_pool_tag" }), true);
+});
+
+test("pre-start state enforcement executes sequential forcedMods, !mp set, and !mp start before match locks", async () => {
+  const commandsSent: string[] = [];
+
+  const mockRoom: any = {
+    beatmapId: () => 123456,
+    command: async (cmd: string) => { commandsSent.push(cmd); },
+  };
+
+  // 1. Minigame with forced mods (e.g. Speedom -> DT)
+  const dtMinigame = {
+    id: "speedom",
+    teamMode: 0,
+    scoreMode: 0,
+    forcedMods: "DT",
+  };
+
+  const starter1 = new MatchStarter({
+    room: mockRoom,
+    isMatchActive: () => false,
+    getCurrentMinigame: () => dtMinigame,
+    onAutoStart: async () => {
+      commandsSent.push("!mp start");
+    },
+  });
+
+  await starter1.triggerAutoStart();
+
+  assert.deepEqual(
+    commandsSent,
+    ["!mp mods DT", "!mp set 0 0", "!mp start"],
+    "Must dispatch !mp mods DT, then !mp set 0 0, then !mp start in exact sequence"
+  );
+
+  commandsSent.length = 0;
+
+  // 2. Minigame without forced mods (e.g. Classic Showdown / Freemod)
+  const freeMinigame = {
+    id: "classic-showdown",
+    teamMode: 2,
+    scoreMode: 1,
+    forcedMods: "",
+  };
+
+  const starter2 = new MatchStarter({
+    room: mockRoom,
+    isMatchActive: () => false,
+    getCurrentMinigame: () => freeMinigame,
+    onAutoStart: async () => {
+      commandsSent.push("!mp start");
+    },
+  });
+
+  await starter2.triggerAutoStart();
+
+  assert.deepEqual(
+    commandsSent,
+    ["!mp set 2 1", "!mp start"],
+    "Must NOT dispatch !mp mods when forcedMods is empty, but MUST dispatch !mp set 2 1"
+  );
+});
+
+test("room title reversion uses trimmed string normalization and executes on lifecycle checkpoints (join, leave, host pass)", async () => {
+  const commandsSent: string[] = [];
+  let currentRoomTitle = "osu!Party Lobby [5-8*]";
+  let playerJoinListener: (() => void) | undefined;
+  let playerLeaveListener: (() => void) | undefined;
+  let hostChangeListener: (() => void) | undefined;
+
+  const mockRoom: any = {
+    command: async (cmd: string) => { commandsSent.push(cmd); },
+    name: () => currentRoomTitle,
+    password: () => "pass123",
+    onPlayerJoined: (fn: () => void) => { playerJoinListener = fn; },
+    onPlayerLeft: (fn: () => void) => { playerLeaveListener = fn; },
+    onHostChanged: (fn: () => void) => { hostChangeListener = fn; },
+  };
+
+  const config: any = {
+    title: "osu!Party Lobby [5-8*]",
+    password: "pass123",
+    locks: {},
+  };
+
+  const keeper = new LobbyKeeper({
+    room: mockRoom,
+    getConfig: () => config,
+    getCurrentMinigame: () => undefined,
+    getCurrentForcedMods: () => undefined,
+  });
+
+  keeper.bindListeners();
+  assert.ok(playerJoinListener, "Must bind player joined listener");
+  assert.ok(playerLeaveListener, "Must bind player left listener");
+  assert.ok(hostChangeListener, "Must bind host changed listener");
+
+  // 1. Title with leading/trailing whitespace should NOT trigger re-application
+  currentRoomTitle = "   osu!Party Lobby [5-8*]   ";
+  await keeper.enforceTitle(currentRoomTitle);
+  assert.equal(commandsSent.length, 0, "Trimmed whitespace comparison must not trigger redundant !mp name");
+
+  // 2. Modified title triggers !mp name restoration
+  currentRoomTitle = "Host's Custom Room";
+  await keeper.enforceTitle(currentRoomTitle);
+  assert.equal(commandsSent[commandsSent.length - 1], "!mp name osu!Party Lobby [5-8*]");
+
+  commandsSent.length = 0;
+
+  // 3. Player joined lifecycle checkpoint restores modified title
+  currentRoomTitle = "Sneaky Host Name";
+  playerJoinListener!();
+  await new Promise(r => setTimeout(r, 60));
+  assert.equal(commandsSent[commandsSent.length - 1], "!mp name osu!Party Lobby [5-8*]");
+
+  commandsSent.length = 0;
+
+  // 4. Player left lifecycle checkpoint restores modified title
+  currentRoomTitle = "Sneaky Host Name 2";
+  playerLeaveListener!();
+  await new Promise(r => setTimeout(r, 60));
+  assert.equal(commandsSent[commandsSent.length - 1], "!mp name osu!Party Lobby [5-8*]");
+
+  commandsSent.length = 0;
+
+  // 5. Host changed lifecycle checkpoint restores modified title
+  currentRoomTitle = "Sneaky Host Name 3";
+  hostChangeListener!();
+  await new Promise(r => setTimeout(r, 60));
+  assert.equal(commandsSent[commandsSent.length - 1], "!mp name osu!Party Lobby [5-8*]");
+});
+
+test("Boss Battle resolves NoMod top play with overrideMods 'None' and pre-start issues !mp mods None", async () => {
+  const mockOsuApi: any = {
+    user: async () => ({ id: 999 }),
+    userBestScores: async () => [
+      {
+        beatmap: { id: 112233 },
+        mods: [], // Clean NoMod top play
+      },
+    ],
+  };
+
+  const result = await resolveMinigameMap("bot_api_host_top", {
+    hostUsername: "NoModGod",
+    playerCount: 4,
+    osu: mockOsuApi,
+  });
+
+  assert.ok(result);
+  assert.equal(result.beatmapId, 112233);
+  assert.equal(result.overrideMods, "None", "NoMod top play must set overrideMods to None");
+  assert.equal(result.announcement, "Boss Battle: NoModGod's #1 top score loaded (NM).");
+
+  const commandsSent: string[] = [];
+  const mockRoom: any = {
+    beatmapId: () => 112233,
+    command: async (cmd: string) => { commandsSent.push(cmd); },
+  };
+
+  const bossMinigame = {
+    id: "boss-battle",
+    teamMode: 0,
+    scoreMode: 3,
+    forcedMods: result.overrideMods,
+  };
+
+  const starter = new MatchStarter({
+    room: mockRoom,
+    isMatchActive: () => false,
+    getCurrentMinigame: () => bossMinigame,
+    onAutoStart: async () => {
+      commandsSent.push("!mp start");
+    },
+  });
+
+  await starter.triggerAutoStart();
+
+  assert.deepEqual(
+    commandsSent,
+    ["!mp mods None", "!mp set 0 3", "!mp start"],
+    "Must dispatch !mp mods None to lock into strict NoMod"
+  );
+});
+
+test("pre-start enforcement reverts altered room title immediately prior to match launch", async () => {
+  const commandsSent: string[] = [];
+  let roomTitle = "Rogue Host Title";
+
+  const mockRoom: any = {
+    beatmapId: () => 55555,
+    name: () => roomTitle,
+    command: async (cmd: string) => { commandsSent.push(cmd); },
+  };
+
+  const starter = new MatchStarter({
+    room: mockRoom,
+    isMatchActive: () => false,
+    getTargetTitle: () => "osu!Party Grand Prix",
+    getCurrentMinigame: () => ({ id: "classic", teamMode: 0, scoreMode: 3 }),
+    onAutoStart: async () => {
+      commandsSent.push("!mp start");
+    },
+  });
+
+  await starter.triggerAutoStart();
+
+  assert.deepEqual(
+    commandsSent,
+    ["!mp name osu!Party Grand Prix", "!mp set 0 3", "!mp start"],
+    "Must revert room title before !mp start"
+  );
+
+  // Whitespace padded title check
+  commandsSent.length = 0;
+  roomTitle = "  osu!Party Grand Prix  ";
+  await starter.triggerAutoStart();
+  assert.deepEqual(
+    commandsSent,
+    ["!mp set 0 3", "!mp start"],
+    "Trimmed match must not trigger redundant !mp name"
+  );
+});
+
+test("generateDefaultLobbyTitle dynamic star range interpolation and fallback formatting", () => {
+  // 1. Both minStars and maxStars set -> standard range interpolation
+  assert.equal(
+    generateDefaultLobbyTitle({ minStars: 5, maxStars: 8 }),
+    "osu!Party | Custom Minigames | AHR | 5.00★ - 8.00★"
+  );
+  assert.equal(
+    generateDefaultLobbyTitle({ minStar: 5.25, maxStar: 7.75 }),
+    "osu!Party | Custom Minigames | AHR | 5.25★ - 7.75★"
+  );
+  assert.equal(
+    generateDefaultLobbyTitle({ regulations: { minStar: 4.5, maxStar: 6.8 } }),
+    "osu!Party | Custom Minigames | AHR | 4.50★ - 6.80★"
+  );
+  assert.equal(
+    generateDefaultLobbyTitle({ regulations: { minStars: 5, maxStars: 8 } }),
+    "osu!Party | Custom Minigames | AHR | 5.00★ - 8.00★"
+  );
+
+  // 2. Fallbacks for missing star ratings:
+  // Both undefined/null or empty -> No Star Limit
+  assert.equal(
+    generateDefaultLobbyTitle({ minStars: undefined, maxStars: undefined }),
+    "osu!Party | Custom Minigames | AHR | No Star Limit"
+  );
+  assert.equal(
+    generateDefaultLobbyTitle({ minStars: null, maxStars: null }),
+    "osu!Party | Custom Minigames | AHR | No Star Limit"
+  );
+  assert.equal(
+    generateDefaultLobbyTitle({}),
+    "osu!Party | Custom Minigames | AHR | No Star Limit"
+  );
+  assert.equal(
+    generateDefaultLobbyTitle(undefined),
+    "osu!Party | Custom Minigames | AHR | No Star Limit"
+  );
+
+  // Disabled regulations -> No Star Limit
+  assert.equal(
+    generateDefaultLobbyTitle({ regulations: { enabled: false, minStar: 5, maxStar: 8 } }),
+    "osu!Party | Custom Minigames | AHR | No Star Limit"
+  );
+  assert.equal(
+    generateDefaultLobbyTitle({ enabled: false, minStars: 5, maxStars: 8 }),
+    "osu!Party | Custom Minigames | AHR | No Star Limit"
+  );
+
+  // Only minimum set -> <min>★+
+  assert.equal(
+    generateDefaultLobbyTitle({ minStars: 6.0 }),
+    "osu!Party | Custom Minigames | AHR | 6.00★+"
+  );
+  assert.equal(
+    generateDefaultLobbyTitle({ minStar: 4.25 }),
+    "osu!Party | Custom Minigames | AHR | 4.25★+"
+  );
+  assert.equal(
+    generateDefaultLobbyTitle({ regulations: { minStar: 6.0 } }),
+    "osu!Party | Custom Minigames | AHR | 6.00★+"
+  );
+
+  // Only maximum set -> Up to <max>★
+  assert.equal(
+    generateDefaultLobbyTitle({ maxStars: 7.0 }),
+    "osu!Party | Custom Minigames | AHR | Up to 7.00★"
+  );
+  assert.equal(
+    generateDefaultLobbyTitle({ maxStar: 8.5 }),
+    "osu!Party | Custom Minigames | AHR | Up to 8.50★"
+  );
+  assert.equal(
+    generateDefaultLobbyTitle({ minStars: 0, maxStars: 7.0 }),
+    "osu!Party | Custom Minigames | AHR | Up to 7.00★"
+  );
+  assert.equal(
+    generateDefaultLobbyTitle({ regulations: { maxStar: 7.0 } }),
+    "osu!Party | Custom Minigames | AHR | Up to 7.00★"
+  );
+});
+
+test("lobby creation resolves dynamic default title when title is blank or whitespace", () => {
+  function resolveLobbyTitle(input: { title?: string; config?: any }): string {
+    const rawTitle = input.title?.trim() || input.config?.title?.trim();
+    return rawTitle || generateDefaultLobbyTitle(input.config);
+  }
+
+  // 1. Blank string -> resolves dynamic template
+  assert.equal(
+    resolveLobbyTitle({ title: "", config: { regulations: { minStar: 5, maxStar: 8 } } }),
+    "osu!Party | Custom Minigames | AHR | 5.00★ - 8.00★"
+  );
+
+  // 2. Whitespace-only string -> resolves dynamic template
+  assert.equal(
+    resolveLobbyTitle({ title: "   ", config: { regulations: { minStar: 6.0 } } }),
+    "osu!Party | Custom Minigames | AHR | 6.00★+"
+  );
+
+  // 3. Undefined title -> resolves dynamic template
+  assert.equal(
+    resolveLobbyTitle({ config: { regulations: { maxStar: 7.0 } } }),
+    "osu!Party | Custom Minigames | AHR | Up to 7.00★"
+  );
+
+  // 4. Undefined title with unconstrained regulations -> No Star Limit
+  assert.equal(
+    resolveLobbyTitle({ config: {} }),
+    "osu!Party | Custom Minigames | AHR | No Star Limit"
+  );
+
+  // 5. Explicit custom title is preserved
+  assert.equal(
+    resolveLobbyTitle({ title: " osu!Party Tourney 2026 ", config: { regulations: { minStar: 5, maxStar: 8 } } }),
+    "osu!Party Tourney 2026"
+  );
+});
+
+test("formatActiveMinigameRuleset produces exact required ruleset announcement string", () => {
+  // 1. Minigame with standard description
+  const speedom = {
+    name: "Speedom",
+    description: "The Freedom to Speed! Forced Double Time.",
+  };
+  assert.equal(
+    formatActiveMinigameRuleset(speedom),
+    "[Minigame] Active Ruleset: Speedom - The Freedom to Speed! Forced Double Time."
+  );
+
+  // 2. Minigame without description falls back cleanly
+  const unconfigured = {
+    name: "Unconfigured Mode",
+    description: "",
+  };
+  assert.equal(
+    formatActiveMinigameRuleset(unconfigured),
+    "[Minigame] Active Ruleset: Unconfigured Mode - Follow current lobby regulations!"
+  );
+});
+
+test("late-joiner receives active minigame ruleset announcement when joining active session", async () => {
+  const chatMessages: string[] = [];
+
+  class MockLateJoinController {
+    currentMinigame?: { name: string; description: string };
+    matchId?: number;
+    currentRound = 3;
+    totalRounds = 10;
+
+    room = {
+      say: async (msg: string) => { chatMessages.push(msg); },
+      message: async (msg: string) => { chatMessages.push(msg); },
+      players: () => [{ id: 1, username: "HostPlayer" }, { id: 2, username: "LateJoiner" }],
+      host: () => ({ id: 1, username: "HostPlayer" }),
+    };
+
+    async playerJoined(player: { id: number; username: string }) {
+      const isInitializingHost = (this.currentRound === 1 && false) || this.room.players().length <= 1 || this.room.host()?.id === player.id;
+      if (!isInitializingHost) {
+        await this.room.say(`[Lobby] Welcome, ${player.username}! Current game: Round ${this.currentRound}/${this.totalRounds}. You start with 0 session points and will enter the host queue on the next map.`);
+      }
+
+      const currentMinigame = this.currentMinigame;
+      const isMatchInProgressOrQueued = Boolean(this.matchId || currentMinigame);
+      if (currentMinigame && isMatchInProgressOrQueued) {
+        const announcement = formatActiveMinigameRuleset(currentMinigame);
+        if (typeof (this.room as any).message === "function") {
+          await (this.room as any).message(announcement);
+        } else {
+          await this.room.say(announcement);
+        }
+      }
+    }
+  }
+
+  const controller = new MockLateJoinController();
+
+  // 1. Active minigame queued (Speedom)
+  controller.currentMinigame = {
+    name: "Speedom",
+    description: "The Freedom to Speed! Forced Double Time.",
+  };
+  controller.matchId = undefined; // Queued before match start
+
+  await controller.playerJoined({ id: 2, username: "LateJoiner" });
+
+  assert.equal(chatMessages.length, 2);
+  assert.equal(
+    chatMessages[0],
+    "[Lobby] Welcome, LateJoiner! Current game: Round 3/10. You start with 0 session points and will enter the host queue on the next map."
+  );
+  assert.equal(
+    chatMessages[1],
+    "[Minigame] Active Ruleset: Speedom - The Freedom to Speed! Forced Double Time."
+  );
+
+  // 2. Mid-match join (match in progress)
+  chatMessages.length = 0;
+  controller.matchId = 999;
+  controller.currentMinigame = {
+    name: "Boss Battle",
+    description: "Beat the host's #1 play!",
+  };
+
+  await controller.playerJoined({ id: 3, username: "MidGameJoiner" });
+
+  assert.equal(chatMessages.length, 2);
+  assert.equal(
+    chatMessages[1],
+    "[Minigame] Active Ruleset: Boss Battle - Beat the host's #1 play!"
+  );
+
+  // 3. No active minigame (before round setup) -> No ruleset announcement
+  chatMessages.length = 0;
+  controller.currentMinigame = undefined;
+  controller.matchId = undefined;
+
+  await controller.playerJoined({ id: 4, username: "EarlyJoiner" });
+
+  assert.equal(chatMessages.length, 1);
+  assert.equal(
+    chatMessages[0],
+    "[Lobby] Welcome, EarlyJoiner! Current game: Round 3/10. You start with 0 session points and will enter the host queue on the next map."
+  );
+  assert.ok(!chatMessages.some(m => m.includes("[Minigame] Active Ruleset:")));
+});
 
 

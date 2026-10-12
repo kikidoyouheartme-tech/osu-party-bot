@@ -62,4 +62,25 @@ export class OsuApi {
     if (!response.ok) throw new Error(`osu! most played lookup failed (${response.status})`);
     return response.json() as Promise<any[]>;
   }
+
+  async beatmapAttributes(beatmapId: number, mods: string[] = [], ruleset?: GameMode): Promise<{ star_rating: number; [key: string]: any } | undefined> {
+    try {
+      const body: any = { mods };
+      if (ruleset) body.ruleset = ruleset;
+      const response = await fetch(`https://osu.ppy.sh/api/v2/beatmaps/${beatmapId}/attributes`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${await this.accessToken()}`,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify(body),
+      });
+      if (!response.ok) return undefined;
+      const json = await response.json() as any;
+      return json?.attributes;
+    } catch {
+      return undefined;
+    }
+  }
 }

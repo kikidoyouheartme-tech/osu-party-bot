@@ -4,7 +4,7 @@ import { PrismaClient } from "@prisma/client";
 import { z } from "zod";
 import { BanchoGateway } from "./adapters/bancho.js";
 import { OsuApi } from "./adapters/osu.js";
-import { LobbyController } from "./lobby-controller.js";
+import { LobbyController, generateDefaultLobbyTitle } from "./lobby-controller.js";
 import { DEFAULT_CONFIG, type LobbyConfig } from "./types.js";
 import { PARTY_MINIGAMES } from "./services/party-minigames.js";
 
@@ -64,24 +64,26 @@ const configSchema = z.object({
   }).partial().optional(),
 }).partial();
 
-async function createLobby(input: { title: string; password?: string; config?: Partial<LobbyConfig> }) {
+async function createLobby(input: { title?: string; password?: string; config?: Partial<LobbyConfig> }) {
+  const rawTitle = input.title?.trim() || input.config?.title?.trim();
+  const title = rawTitle || generateDefaultLobbyTitle(input.config);
   const config: LobbyConfig = {
     ...DEFAULT_CONFIG,
     totalRounds: activeConfig.totalRounds,
     minigameWeights: { ...activeConfig.minigameWeights },
     ranked: activeConfig.ranked,
     ...input.config,
-    title: input.title,
+    title,
     password: input.password,
     regulations: { ...DEFAULT_CONFIG.regulations, ...input.config?.regulations },
     locks: { ...DEFAULT_CONFIG.locks, ...input.config?.locks },
   };
-  const room = await bancho.makeLobby(input.title, input.password);
+  const room = await bancho.makeLobby(title, input.password);
   if (config.regulations.freeMod) await room.command("!mp mods 0 freemod");
   const banchoId = room.id();
   if (!banchoId) throw new Error("Could not identify newly-created multiplayer lobby");
   const lobby = await db.lobby.create({
-    data: { banchoId, name: input.title, password: input.password, config: config as any },
+    data: { banchoId, name: title, password: input.password, config: config as any },
   });
   const controller = new LobbyController(db, lobby.id, room, osu, config, env.BANCHO_USERNAME);
   controller.onClosed(() => void recreateClosedLobby(lobby.id, controller));
@@ -417,12 +419,12 @@ async function main() {
   app.post("/lobbies", async (req, res, next) => {
     try {
       const body = z.object({
-        title: z.string().min(3).max(80),
+        title: z.string().max(80).optional(),
         password: z.string().max(64).optional(),
         config: configSchema.optional(),
       }).parse(req.body);
 
-      res.status(201).json(await createLobby(body as { title: string; password?: string; config?: Partial<LobbyConfig> }));
+      res.status(201).json(await createLobby(body as { title?: string; password?: string; config?: Partial<LobbyConfig> }));
     } catch (e) {
       next(e);
     }
@@ -438,7 +440,7 @@ async function main() {
         eventChance: z.number().min(0).max(1).optional(),
         ranked: z.boolean().optional(),
         autoRecreateOnInactivity: z.boolean().optional(),
-        title: z.string().min(3).max(80).optional(),
+        title: z.string().max(80).optional(),
         password: z.string().min(1).max(64).optional(),
         removePassword: z.boolean().optional(),
       }).parse(req.body);

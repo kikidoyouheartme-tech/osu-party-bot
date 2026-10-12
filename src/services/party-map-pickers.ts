@@ -80,7 +80,7 @@ export async function resolveMinigameMap(
         if (!beatmapId) return null;
         return {
           beatmapId,
-          ...(forced ? { overrideMods: forced } : {}),
+          overrideMods: forced || "None",
           announcement: `Boss Battle: ${hostUsername}'s #1 top score loaded (${forced || "NM"}).`,
         };
       } catch {

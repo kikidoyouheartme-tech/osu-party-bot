@@ -192,7 +192,7 @@ export const PARTY_MINIGAMES: MinigameDefinition[] = [
     id: "speedom",
     name: "Speedom",
     category: "Mod Challenge",
-    description: "1.5x speed rush! Forced Double Time.",
+    description: "The Freedom to Speed! Forced Double Time.",
     mapPicker: "host",
     teamMode: 0,
     scoreMode: 0,
@@ -317,10 +317,16 @@ export function getMinigame(id: string): MinigameDefinition | undefined {
 
 export function rollNextMinigame(
   previousMinigame?: MinigameDefinition | string,
-  weights?: Record<string, number>
+  weights?: Record<string, number>,
+  currentRound?: number
 ): MinigameDefinition {
   const prevGame = typeof previousMinigame === "string" ? getMinigame(previousMinigame) : previousMinigame;
   let eligible = PARTY_MINIGAMES.filter((g) => g.id !== prevGame?.id);
+
+  // If first round, exclude PartyPoint Wager since players don't have session points yet
+  if (currentRound === 1) {
+    eligible = eligible.filter((g) => g.id !== "partypoint-wager");
+  }
 
   // If previous round was an automated map picker, force host picker for next round
   if (prevGame && prevGame.mapPicker !== "host") {
@@ -334,6 +340,13 @@ export function rollNextMinigame(
 
   if (eligible.length === 0) {
     eligible = PARTY_MINIGAMES.filter((g) => g.mapPicker === "host");
+    if (currentRound === 1) {
+      eligible = eligible.filter((g) => g.id !== "partypoint-wager");
+    }
+  }
+
+  if (eligible.length === 0) {
+    eligible = PARTY_MINIGAMES.filter((g) => (currentRound === 1 ? g.id !== "partypoint-wager" : true));
   }
 
   // Weighted random roll
